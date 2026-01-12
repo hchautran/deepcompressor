@@ -1,0 +1,86 @@
+# SAM2 Hiera-Tiny W4A8 Quantization Configuration
+# 4-bit weights, 8-bit activations for facebook/sam2-hiera-tiny
+
+quant:
+  # Calibration settings
+  calib:
+    num_samples: 128
+    batch_size: 1
+
+  # Weight quantization - 4-bit
+  wgts:
+    dtype: uint4                    # 4-bit unsigned integer
+    zero_point: PostScale           # Zero point after scaling
+    static: true                    # Static quantization for weights
+    group_shapes:
+      - [1, 128]                    # Per-channel with group size 128
+    scale_dtypes:
+      - torch.float16               # FP16 scales
+
+    # GPTQ configuration for better accuracy
+    kernel_gptq:
+      damp_percentage: 0.01         # Damping factor
+      block_size: 128               # Block size for GPTQ
+      num_inv_tries: 250            # Number of inverse attempts
+      hessian_block_size: 512       # Hessian matrix block size
+      skips: []                     # No skips
+
+    # Skip certain layers
+    skip_patch_embed: true          # Don't quantize patch embedding (first layer)
+    skip_first_block: false         # Quantize first Hiera block
+    skip_last_block: false          # Quantize last Hiera block
+    skip_decoder: false             # Quantize decoder
+
+    # Dynamic range calibration
+    calib_range:
+      objective: TensorError
+      strategy: GridSearch
+      granularity: Group
+      degree: 2.4
+      num_grids: 100
+
+  # Input activation quantization - 8-bit
+  ipts:
+    dtype: uint8                    # 8-bit unsigned integer
+    zero_point: PostScale
+    static: false                   # Dynamic quantization for activations
+    per_token: true                 # Per-token quantization
+    group_shapes:
+      - [1, -1]                     # Per-token (batch, seq_length)
+    scale_dtypes:
+      - torch.float16
+
+    # Calibration for activations
+    calib_range:
+      objective: TensorError
+      strategy: GridSearch
+      granularity: Group
+      degree: 2.4
+      num_grids: 100
+
+  # Output activation quantization - 8-bit
+  opts:
+    dtype: uint8
+    zero_point: PostScale
+    static: false
+    per_token: true
+    group_shapes:
+      - [1, -1]
+    scale_dtypes:
+      - torch.float16
+
+    calib_range:
+      objective: TensorError
+      strategy: GridSearch
+      granularity: Group
+      degree: 2.4
+      num_grids: 100
+
+  # Rotation (optional, disabled by default)
+  rotation:
+    enabled: false
+
+  # Smooth quantization (optional, disabled by default)
+  smooth:
+    enabled: false
+    alpha: 0.5
