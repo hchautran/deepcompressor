@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-"""SAM2 dataset utilities."""
+"""SAM2 calibration dataset."""
 
-from .calib import get_coco_calibration_loader, get_sa1b_calibration_loader
+from .calib import Sam2CalibConfig, Sam2CalibDataset
 
-__all__ = [
-    "get_coco_calibration_loader",
-    "get_sa1b_calibration_loader",
-]
+__all__ = ["Sam2CalibConfig", "Sam2CalibDataset"]

@@ -1,22 +1,6 @@
 # -*- coding: utf-8 -*-
-"""SAM2 neural network utilities."""
+"""SAM2 neural network structure definitions."""
 
-from .struct import (
-    Sam2AttentionStruct,
-    Sam2ConfigStruct,
-    Sam2FeedForwardStruct,
-    Sam2HieraBlockStruct,
-    Sam2ModelStruct,
-    Sam2ModuleStruct,
-    Sam2VisionEncoderStruct,
-)
+from .struct import Sam2ModelStruct
 
-__all__ = [
-    "Sam2ConfigStruct",
-    "Sam2ModelStruct",
-    "Sam2VisionEncoderStruct",
-    "Sam2HieraBlockStruct",
-    "Sam2AttentionStruct",
-    "Sam2FeedForwardStruct",
-    "Sam2ModuleStruct",
-]
+__all__ = ["Sam2ModelStruct"]

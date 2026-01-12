@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""SAM2 Quantizer Configuration."""
+"""SAM2 quantizer configuration."""
 
 from dataclasses import dataclass, field
 
@@ -10,20 +10,21 @@ from deepcompressor.calib.config import SkipBasedDynamicRangeCalibConfig, SkipBa
 from deepcompressor.data.dtype import QuantDataType
 from deepcompressor.quantizer.config import QuantizerConfig
 from deepcompressor.quantizer.kernel import QuantGptqConfig
-from deepcompressor.utils.config import EnableConfig, IncludeBasedConfig, SkipBasedConfig
+from deepcompressor.utils.config import EnableConfig, SkipBasedConfig
 
 __all__ = [
     "Sam2QuantizerConfig",
     "Sam2WeightQuantizerConfig",
     "Sam2ActivationQuantizerConfig",
     "Sam2ModuleQuantizerConfig",
+    "Sam2GPTQConfig",
 ]
 
 
 @configclass
 @dataclass
 class Sam2GPTQConfig(SkipBasedConfig, QuantGptqConfig):
-    """Configuration for SAM2 GPTQ quantization.
+    """Configuration for GPTQ quantization.
 
     Args:
         damp_percentage (`float`, *optional*, defaults to `0.01`):
@@ -32,10 +33,7 @@ class Sam2GPTQConfig(SkipBasedConfig, QuantGptqConfig):
             The block size of the GPTQ quantization.
         num_inv_tries (`int`, *optional*, defaults to `200`):
             The number of tries for the inverse.
-        hessian_block_size (`int`, *optional*, defaults to `-1`):
-            The block size when calculating the Hessian.
-        skips (`list[str]`, *optional*, defaults to `[]`):
-            List of module names to skip during GPTQ quantization.
+        skips: list[str] = field(default_factory=list)
     """
 
     pass
@@ -51,14 +49,14 @@ class Sam2QuantizerConfig(QuantizerConfig):
             The quantization data type.
         zero_point (`ZeroPointDomain` or `None`, *optional*, defaults to `None`):
             The zero-point domain.
-        group_shapes (`Sequence[Sequence[int]]`, *optional*, defaults to `((-1, -1),)`):
+        group_shapes (`Sequence[Sequence[int]]`, *optional*, defaults to `((-1, -1, -1),)`):
             The shapes for per-group quantization.
         scale_dtypes (`Sequence[torch.dtype | QuantDataType | None]`, *optional*, defaults to `(None,)`):
             The quantization scale data type for per-group quantization.
         static (`bool`, *optional*, defaults to `False`):
             Whether to use static quantization.
         kernel_gptq (`Sam2GPTQConfig` or `None`, *optional*, defaults to `None`):
-            The GPTQ quantization configuration.
+            The gptq quantization configuration.
         low_rank (`SkipBasedQuantLowRankCalibConfig` or `None`, *optional*, defaults to `None`):
             The quantization low-rank branch calibration configuration.
         calib_range (`SkipBasedDynamicRangeCalibConfig` or `None`, *optional*, defaults to `None`):
@@ -86,12 +84,12 @@ class Sam2QuantizerConfig(QuantizerConfig):
 
     @property
     def enabled_gptq(self) -> bool:
-        """Whether GPTQ quantization kernel calibration is enabled."""
+        """Whether quantization kernel calibration is enabled."""
         return self.kernel_gptq is not None and self.kernel_gptq.is_enabled()
 
     @property
     def enabled_low_rank(self) -> bool:
-        """Whether quantization low-rank (SVDQuant) calibration is enabled."""
+        """Whether quantization SVD calibration is enabled."""
         return self.low_rank is not None and self.low_rank.is_enabled()
 
     @property
@@ -99,97 +97,197 @@ class Sam2QuantizerConfig(QuantizerConfig):
         """Whether quantization dynamic range calibration is enabled."""
         return self.calib_range is not None
 
-
-@configclass
-@dataclass
-class Sam2WeightQuantizerConfig(Sam2QuantizerConfig):
-    """SAM2 weight quantizer configuration.
-
-    Args:
-        dtype (`QuantDataType` or `None`, *optional*, defaults to `None`):
-            The quantization data type.
-        static (`bool`, *optional*, defaults to `True`):
-            Whether to use static quantization for weights.
-        skip_patch_embed (`bool`, *optional*, defaults to `True`):
-            Whether to skip quantizing patch embedding layer.
-        skip_first_block (`bool`, *optional*, defaults to `False`):
-            Whether to skip quantizing the first transformer block.
-        skip_last_block (`bool`, *optional*, defaults to `False`):
-            Whether to skip quantizing the last transformer block.
-        skip_decoder (`bool`, *optional*, defaults to `False`):
-            Whether to skip quantizing the decoder.
-    """
-
-    static: bool = True
-    skip_patch_embed: bool = True
-    skip_first_block: bool = False
-    skip_last_block: bool = False
-    skip_decoder: bool = False
+    def generate_calib_dirname(self) -> str:
+        """Generate the name for quantization calibration."""
+        name = ""
+        if self.static:
+            name += ".static"
+        if self.enabled_gptq:
+            name += ".gptq"
+        if self.enabled_low_rank:
+            name += ".lowrank"
+        if self.enabled_calib_range and (self.calib_range.needs_search or self.calib_range.ratio != 1):
+            name += ".range"
+        return name[1:] if name else ""
 
 
 @configclass
 @dataclass
-class Sam2ActivationQuantizerConfig(Sam2QuantizerConfig):
-    """SAM2 activation quantizer configuration.
-
-    Args:
-        dtype (`QuantDataType` or `None`, *optional*, defaults to `None`):
-            The quantization data type.
-        static (`bool`, *optional*, defaults to `False`):
-            Whether to use static quantization for activations.
-        per_token (`bool`, *optional*, defaults to `True`):
-            Whether to use per-token quantization for activations.
-    """
-
-    static: bool = False
-    per_token: bool = True
-
-
-@configclass
-@dataclass
-class Sam2ModuleQuantizerConfig(EnableConfig):
-    """SAM2 module quantizer configuration combining weights and activations.
-
-    Args:
-        wgts (`Sam2WeightQuantizerConfig` or `None`, *optional*, defaults to `None`):
-            The weight quantizer configuration.
-        ipts (`Sam2ActivationQuantizerConfig` or `None`, *optional*, defaults to `None`):
-            The input activation quantizer configuration.
-        opts (`Sam2ActivationQuantizerConfig` or `None`, *optional*, defaults to `None`):
-            The output activation quantizer configuration.
-    """
-
-    wgts: Sam2WeightQuantizerConfig | None = None
-    ipts: Sam2ActivationQuantizerConfig | None = None
-    opts: Sam2ActivationQuantizerConfig | None = None
+class SkipBasedSam2QuantizerConfig(SkipBasedConfig, Sam2QuantizerConfig):
+    """SAM2 model quantizer configuration with skip support."""
 
     def __post_init__(self) -> None:
-        if self.wgts is None:
-            self.wgts = Sam2WeightQuantizerConfig()
-        if self.ipts is None:
-            self.ipts = Sam2ActivationQuantizerConfig()
-        if self.opts is None:
-            self.opts = Sam2ActivationQuantizerConfig()
+        super().__post_init__()
+        if self.quant_dtype is None:
+            self.skips.clear()
 
-    def is_enabled(self) -> bool:
-        """Check if any quantization is enabled."""
-        return (
-            (self.wgts is not None and self.wgts.is_enabled())
-            or (self.ipts is not None and self.ipts.is_enabled())
-            or (self.opts is not None and self.opts.is_enabled())
-        )
+
+@configclass
+@dataclass
+class Sam2WeightQuantizerConfig(SkipBasedSam2QuantizerConfig):
+    """SAM2 model weight quantizer configuration.
+
+    Args:
+        dtype (`QuantDataType` or `None`, *optional*, defaults to `None`):
+            The quantization data type.
+        zero_point (`ZeroPointDomain` or `None`, *optional*, defaults to `None`):
+            The zero-point domain.
+        group_shapes (`Sequence[Sequence[int]]`, *optional*, defaults to `((-1, -1, -1),)`):
+            The shapes for per-group quantization.
+        scale_dtypes (`Sequence[torch.dtype | QuantDataType | None]`, *optional*, defaults to `(None,)`):
+            The quantization scale data type for per-group quantization.
+        skips (`list[str]`, *optional*, defaults to `[]`):
+            The keys of the modules to skip.
+        kernel_gptq (`Sam2GPTQConfig` or `None`, *optional*, defaults to `None`):
+            The gptq quantization configuration.
+        low_rank (`SkipBasedQuantLowRankCalibConfig` or `None`, *optional*, defaults to `None`):
+            The quantization low-rank branch calibration configuration.
+        calib_range (`SkipBasedDynamicRangeCalibConfig` or `None`, *optional*, defaults to `None`):
+            The quantizer dynamic range calibration configuration.
+    """
+
+    static: bool = field(init=False, default=True)
+
+    @property
+    def needs_calib_data(self) -> bool:
+        return self.enabled_calib_range and self.calib_range.needs_search
+
+
+@configclass
+@dataclass
+class Sam2ActivationQuantizerConfig(SkipBasedSam2QuantizerConfig):
+    """SAM2 model activation quantizer configuration.
+
+    Args:
+        dtype (`QuantDataType` or `None`, *optional*, defaults to `None`):
+            The quantization data type.
+        zero_point (`ZeroPointDomain` or `None`, *optional*, defaults to `None`):
+            The zero-point domain.
+        group_shapes (`Sequence[Sequence[int]]`, *optional*, defaults to `((-1, -1, -1),)`):
+            The shapes for per-group quantization.
+        scale_dtypes (`Sequence[torch.dtype | QuantDataType | None]`, *optional*, defaults to `(None,)`):
+            The quantization scale data type for per-group quantization.
+        skips (`list[str]`, *optional*, defaults to `[]`):
+            The keys of the modules to skip.
+        static (`bool`, *optional*, defaults to `False`):
+            Whether to use static quantization.
+        calib_range (`SkipBasedDynamicRangeCalibConfig` or `None`, *optional*, defaults to `None`):
+            The quantizer dynamic range calibration configuration.
+        allow_unsigned (`bool`, *optional*, defaults to `False`):
+            Whether to allow unsigned data type for activation quantization.
+    """
+
+    kernel_gptq: None = field(init=False, default=None)
+    low_rank: None = field(init=False, default=None)
+    allow_unsigned: bool = False
+
+    @property
+    def needs_calib_data(self) -> bool:
+        return self.enabled_calib_range and (self.calib_range.needs_search or self.static)
+
+    def generate_dirnames(
+        self,
+        *,
+        prefix: str = "",
+        shape: torch.Size | tuple[int, ...] = (1024, 1024, 16, 16),
+        default_dtype: torch.dtype = torch.float16,
+        **kwargs,
+    ) -> list[str]:
+        names = super().generate_dirnames(prefix=prefix, shape=shape, default_dtype=default_dtype)
+        if self.allow_unsigned:
+            names[1] += ".u"
+        return names
+
+    def for_unsigned(self) -> "Sam2ActivationQuantizerConfig":
+        """Get the quantizer configuration for unsigned activations."""
+        if isinstance(self.dtype, QuantDataType) and self.allow_unsigned:
+            return Sam2ActivationQuantizerConfig(
+                dtype=self.dtype.to_unsigned(),
+                zero_point=self.zero_point,
+                group_shapes=self.group_shapes,
+                scale_dtypes=self.scale_dtypes,
+                skips=self.skips,
+                static=self.static,
+                calib_range=self.calib_range,
+                allow_unsigned=self.allow_unsigned,
+            )
+        else:
+            return self
+
+
+@configclass
+@dataclass(kw_only=True)
+class Sam2ModuleQuantizerConfig(EnableConfig):
+    """SAM2 model module quantizer configuration.
+
+    Args:
+        wgts (`Sam2WeightQuantizerConfig`):
+            The weight quantization configuration.
+        ipts (`Sam2ActivationQuantizerConfig`):
+            The input activation quantization configuration.
+        opts (`Sam2ActivationQuantizerConfig`):
+            The output activation quantization configuration.
+    """
+
+    wgts: Sam2WeightQuantizerConfig
+    ipts: Sam2ActivationQuantizerConfig
+    opts: Sam2ActivationQuantizerConfig
+    unsigned_ipts: Sam2ActivationQuantizerConfig = field(init=False)
+
+    def is_enabled(self):
+        return self.enabled_wgts or self.enabled_ipts or self.enabled_opts
 
     @property
     def enabled_wgts(self) -> bool:
-        """Whether weight quantization is enabled."""
+        """Whether to enable weight quantization."""
         return self.wgts is not None and self.wgts.is_enabled()
 
     @property
     def enabled_ipts(self) -> bool:
-        """Whether input activation quantization is enabled."""
+        """Whether to enable input activation quantization."""
         return self.ipts is not None and self.ipts.is_enabled()
 
     @property
     def enabled_opts(self) -> bool:
-        """Whether output activation quantization is enabled."""
+        """Whether to enable output activation quantization."""
         return self.opts is not None and self.opts.is_enabled()
+
+    def __post_init__(self) -> None:
+        if self.enabled_opts:
+            raise NotImplementedError("Output activation quantization is not supported yet.")
+
+    def generate_dirnames(
+        self,
+        *,
+        prefix: str = "",
+        shape: torch.Size | tuple[int, ...] = (1024, 1024, 16, 16),
+        default_dtype: torch.dtype = torch.float16,
+        **kwargs,
+    ) -> list[str]:
+        wgts_names = self.wgts.generate_dirnames(prefix="w", shape=shape, default_dtype=default_dtype)
+        ipts_names = self.ipts.generate_dirnames(prefix="x", shape=shape, default_dtype=default_dtype)
+        opts_names = self.opts.generate_dirnames(prefix="y", shape=shape, default_dtype=default_dtype)
+        names = [
+            f"{wgts_name}-{ipts_name}-{opts_name}"
+            for wgts_name, ipts_name, opts_name in zip(wgts_names, ipts_names, opts_names, strict=True)
+        ]
+        if prefix:
+            names = [f"{prefix}.[{name}]" for name in names]
+        return names
+
+    def generate_calib_dirname(self) -> str:
+        """Generate the name for quantization calibration."""
+        name = ""
+        if self.enabled_wgts:
+            calib_name = self.wgts.generate_calib_dirname()
+            if calib_name:
+                name += f"-w.{calib_name}"
+        if self.enabled_ipts:
+            calib_name = self.ipts.generate_calib_dirname()
+            if calib_name:
+                name += f"-x.{calib_name}"
+        if self.enabled_opts:
+            calib_name = self.opts.generate_calib_dirname()
+            if calib_name:
+                name += f"-y.{calib_name}"
+        return name[1:] if name else name

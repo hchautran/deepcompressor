@@ -1,269 +1,282 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-SAM2 (Segment Anything Model 2) Quantization from HuggingFace
+"""SAM2 post-training quantization script.
 
-This script demonstrates how to quantize a SAM2 model from HuggingFace
-to 4-bit weights using the DeepCompressor framework.
+This script performs post-training quantization on SAM2 (Segment Anything Model 2)
+using the DeepCompressor framework with nunchaku backend support.
 
 Usage:
-    # Quantize SAM2 Hiera-Tiny with W4A8
-    python quantize_sam2.py --model tiny --config configs/hiera_tiny_w4a8.yaml
+    python quantize_sam2.py --config configs/hiera_tiny_w4a8.yaml
 
-    # Quantize SAM2 Hiera-Base with W4A8
-    python quantize_sam2.py --model base --config configs/hiera_base_w4a8.yaml
+    # Or with command-line overrides:
+    python quantize_sam2.py \
+        --model.name tiny \
+        --quant.wgts.dtype uint4 \
+        --quant.ipts.dtype uint8 \
+        --quant.calib.path /path/to/coco/val2017 \
+        --output.root ./outputs/sam2
 
-    # Quantize with COCO dataset
-    python quantize_sam2.py --model tiny --config configs/hiera_tiny_w4a8.yaml \\
-        --dataset coco --coco-root /path/to/coco
+Supported model variants:
+    - tiny: facebook/sam2.1-hiera-tiny (38M params)
+    - small: facebook/sam2.1-hiera-small (46M params)
+    - base-plus: facebook/sam2.1-hiera-base-plus (80M params)
+    - large: facebook/sam2.1-hiera-large (224M params)
 
-    # Weight-only quantization (no calibration needed)
-    python quantize_sam2.py --model tiny --config configs/hiera_tiny_w4only.yaml
+Quantization configurations:
+    - W4A4: 4-bit weights, 4-bit activations
+    - W4A8: 4-bit weights, 8-bit activations
+    - W8A8: 8-bit weights, 8-bit activations
+
+For best accuracy, enable:
+    - smooth quantization (reduces activation outliers)
+    - rotation (Hadamard transform for better weight distribution)
+    - SVDQuant (low-rank compensation for outliers)
 """
 
 import argparse
-import os
-from pathlib import Path
+import sys
+import traceback
 
 import torch
-import yaml
-from omniconfig import OmniConfig
-
-from deepcompressor.app.sam2 import (
-    Sam2QuantConfig,
-    get_coco_calibration_loader,
-    get_sam2_processor,
-    load_sam2_from_huggingface,
-    print_model_info,
-    ptq,
-)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Quantize SAM2 from HuggingFace to 4-bit")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="tiny",
-        choices=["tiny", "small", "base", "large"],
-        help="SAM2 model size (tiny, small, base, large)",
+    """Main entry point for SAM2 quantization."""
+    # Import here to avoid slow imports on --help
+    from deepcompressor.app.sam2 import Sam2PtqRunConfig
+    from deepcompressor.utils import tools
+
+    # Parse configuration
+    parser = argparse.ArgumentParser(
+        description="SAM2 Post-Training Quantization",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
-        help="Path to quantization configuration YAML file",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./quantized_sam2",
-        help="Directory to save quantized model",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="random",
-        choices=["random", "coco", "sa1b"],
-        help="Calibration dataset (random, coco, sa1b)",
-    )
-    parser.add_argument(
-        "--coco-root",
-        type=str,
-        default="",
-        help="Root directory of COCO dataset (required if dataset=coco)",
-    )
-    parser.add_argument(
-        "--sa1b-root",
-        type=str,
-        default="",
-        help="Root directory of SA-1B dataset (required if dataset=sa1b)",
-    )
-    parser.add_argument(
-        "--num-calib-samples",
-        type=int,
         default=None,
-        help="Number of calibration samples (overrides config)",
+        help="Path to YAML configuration file",
     )
     parser.add_argument(
-        "--batch-size",
+        "--model.name",
+        type=str,
+        default="tiny",
+        dest="model_name",
+        help="Model variant: tiny, small, base-plus, large",
+    )
+    parser.add_argument(
+        "--model.device",
+        type=str,
+        default="cuda",
+        dest="model_device",
+        help="Device to run on (cuda or cpu)",
+    )
+    parser.add_argument(
+        "--quant.calib.path",
+        type=str,
+        default="",
+        dest="calib_path",
+        help="Path to calibration dataset (directory of images)",
+    )
+    parser.add_argument(
+        "--quant.calib.num_samples",
         type=int,
-        default=1,
-        help="Batch size for calibration",
+        default=128,
+        dest="calib_num_samples",
+        help="Number of calibration samples",
     )
     parser.add_argument(
-        "--device",
+        "--output.root",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run quantization on",
+        default="./outputs/sam2",
+        dest="output_root",
+        help="Output root directory",
     )
     parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float16",
-        choices=["float16", "float32", "bfloat16"],
-        help="Model data type",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default="./cache",
-        help="Directory for caching intermediate results",
-    )
-    parser.add_argument(
-        "--no-save-model",
+        "--save-model",
         action="store_true",
-        help="Don't save the quantized model",
+        help="Save the quantized model",
+    )
+    parser.add_argument(
+        "--convert-nunchaku",
+        action="store_true",
+        help="Convert to nunchaku format after quantization",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging",
     )
 
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
 
-    print("=" * 80)
-    print("SAM2 HuggingFace Model Quantization")
-    print("=" * 80)
-    print(f"Model: {args.model}")
-    print(f"Config: {args.config}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Output: {args.output_dir}")
-    print(f"Device: {args.device}")
-    print("=" * 80)
+    # Setup logging
+    log_level = tools.logging.DEBUG if args.verbose else tools.logging.INFO
+    tools.logging.setup(level=log_level)
+    logger = tools.logging.getLogger(__name__)
 
-    # Parse dtype
-    dtype_map = {
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    torch_dtype = dtype_map[args.dtype]
+    logger.info("=" * 60)
+    logger.info("SAM2 Post-Training Quantization")
+    logger.info("=" * 60)
 
-    # Load configuration
-    print("\nLoading configuration...")
-    with open(args.config, "r") as f:
-        config_dict = yaml.safe_load(f)
+    # Load configuration from YAML if provided
+    if args.config:
+        logger.info(f"Loading configuration from {args.config}")
+        import yaml
 
-    config = OmniConfig.create(config_dict, schema={"quant": Sam2QuantConfig})
-    config = config.quant
+        with open(args.config) as f:
+            config_dict = yaml.safe_load(f)
+    else:
+        # Build configuration from command-line arguments
+        config_dict = {
+            "model": {
+                "name": args.model_name,
+                "device": args.model_device,
+                "dtype": "float16",
+            },
+            "quant": {
+                "calib": {
+                    "path": args.calib_path,
+                    "num_samples": args.calib_num_samples,
+                },
+                "wgts": {
+                    "dtype": "uint4",
+                    "group_shapes": [[1, 128]],
+                },
+                "ipts": {
+                    "dtype": "uint8",
+                    "group_shapes": [[1, -1]],
+                },
+                "opts": {
+                    "dtype": None,
+                },
+            },
+            "cache": {
+                "root": "./cache/sam2",
+            },
+            "output": {
+                "root": args.output_root,
+            },
+            "seed": args.seed,
+            "save_model": "true" if args.save_model else "false",
+        }
 
-    # Override calibration settings from command line
-    if args.num_calib_samples is not None and config.calib:
-        config.calib.num_samples = args.num_calib_samples
-    if config.calib:
-        config.calib.batch_size = args.batch_size
+    # Create and validate configuration
+    try:
+        from deepcompressor.app.sam2.config import Sam2PtqRunConfig, Sam2ModelConfig
+        from deepcompressor.app.sam2.cache.config import Sam2PtqCacheConfig
+        from deepcompressor.app.sam2.quant.config import Sam2QuantConfig
+        from deepcompressor.app.sam2.quant.quantizer.config import (
+            Sam2WeightQuantizerConfig,
+            Sam2ActivationQuantizerConfig,
+        )
+        from deepcompressor.app.sam2.dataset.calib import Sam2CalibConfig
+        from deepcompressor.utils.config import OutputConfig
 
-    print(f"Configuration loaded:")
-    print(f"  - Weight dtype: {config.wgts.dtype if config.wgts else 'None'}")
-    print(f"  - Activation dtype: {config.ipts.dtype if config.ipts else 'None'}")
-    print(f"  - GPTQ enabled: {config.wgts.enabled_gptq if config.wgts else False}")
-    print(f"  - Calibration samples: {config.calib.num_samples if config.calib else 0}")
+        # Build sub-configs
+        model_config = Sam2ModelConfig(**config_dict.get("model", {}))
 
-    # Load SAM2 model from HuggingFace
-    print("\nLoading SAM2 model from HuggingFace...")
-    model, model_struct = load_sam2_from_huggingface(
-        model_name=args.model,
-        device=args.device,
-        torch_dtype=torch_dtype,
-    )
+        calib_config = Sam2CalibConfig(**config_dict.get("quant", {}).get("calib", {}))
 
-    # Print model information
-    print_model_info(model, model_struct)
+        wgts_dict = config_dict.get("quant", {}).get("wgts", {})
+        ipts_dict = config_dict.get("quant", {}).get("ipts", {})
+        opts_dict = config_dict.get("quant", {}).get("opts", {})
 
-    # Prepare calibration dataloader
-    calib_loader = None
-    needs_calibration = (config.enabled_ipts or config.enabled_opts) and config.calib.num_samples > 0
+        # Handle dtype conversion
+        from deepcompressor.data.dtype import QuantDataType
 
-    if needs_calibration:
-        print("\nPreparing calibration dataset...")
+        if wgts_dict.get("dtype"):
+            wgts_dict["dtype"] = QuantDataType.from_str(wgts_dict["dtype"])
+        if ipts_dict.get("dtype"):
+            ipts_dict["dtype"] = QuantDataType.from_str(ipts_dict["dtype"])
+        if opts_dict.get("dtype"):
+            opts_dict["dtype"] = QuantDataType.from_str(opts_dict["dtype"])
 
-        if args.dataset == "coco":
-            if not args.coco_root:
-                raise ValueError("--coco-root must be specified when using COCO dataset")
+        wgts_config = Sam2WeightQuantizerConfig(**wgts_dict)
+        ipts_config = Sam2ActivationQuantizerConfig(**ipts_dict)
+        opts_config = Sam2ActivationQuantizerConfig(**opts_dict)
 
-            processor = get_sam2_processor(args.model)
-            calib_loader = get_coco_calibration_loader(
-                coco_root=args.coco_root,
-                split="val2017",
-                num_samples=config.calib.num_samples,
-                batch_size=args.batch_size,
-                processor=processor,
-                num_workers=4,
-            )
-            print(f"Using COCO dataset from {args.coco_root}")
+        quant_config = Sam2QuantConfig(
+            wgts=wgts_config,
+            ipts=ipts_config,
+            opts=opts_config,
+            calib=calib_config,
+        )
 
-        elif args.dataset == "sa1b":
-            from deepcompressor.app.sam2 import get_sa1b_calibration_loader
+        cache_config = Sam2PtqCacheConfig(**config_dict.get("cache", {}))
+        output_config = OutputConfig(**config_dict.get("output", {}))
 
-            if not args.sa1b_root:
-                raise ValueError("--sa1b-root must be specified when using SA-1B dataset")
+        config = Sam2PtqRunConfig(
+            model=model_config,
+            quant=quant_config,
+            cache=cache_config,
+            output=output_config,
+            seed=config_dict.get("seed", 42),
+            save_model=config_dict.get("save_model", ""),
+        )
 
-            processor = get_sam2_processor(args.model)
-            calib_loader = get_sa1b_calibration_loader(
-                sa1b_root=args.sa1b_root,
-                num_samples=config.calib.num_samples,
-                batch_size=args.batch_size,
-                processor=processor,
-                num_workers=4,
-            )
-            print(f"Using SA-1B dataset from {args.sa1b_root}")
-
-        elif args.dataset == "random":
-            # Create random calibration data
-            from torch.utils.data import DataLoader, TensorDataset
-
-            print("Using random calibration data")
-            random_images = torch.randn(
-                config.calib.num_samples,
-                3,
-                1024,
-                1024,
-                dtype=torch_dtype,
-            )
-            calib_dataset = TensorDataset(random_images)
-            calib_loader = DataLoader(
-                calib_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-            )
-
-        print(f"Calibration dataset ready with {config.calib.num_samples} samples")
-
-    # Create cache directory
-    os.makedirs(args.cache_dir, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create configuration: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
     # Run quantization
-    print("\nStarting quantization...")
-    quantized_model_struct = ptq(
-        model=model_struct,
-        config=config,
-        calib_loader=calib_loader,
-        cache=None,
-        load_dirpath="",
-        save_dirpath=args.output_dir if not args.no_save_model else "",
-        copy_on_save=False,
-        save_model=not args.no_save_model,
-    )
+    try:
+        logger.info("Starting quantization pipeline...")
+        config.main()
+        logger.info("Quantization complete!")
 
-    if not args.no_save_model:
-        print(f"\nQuantized model saved to: {args.output_dir}")
+        # Convert to nunchaku format if requested
+        if args.convert_nunchaku:
+            logger.info("Converting to nunchaku format...")
+            from deepcompressor.backend.nunchaku.convert_sam2 import convert_to_nunchaku_sam2_state_dicts
+            import os
 
-    # Optional: Test the quantized model
-    print("\nTesting quantized model...")
-    quantized_model_struct.module.eval()
-    with torch.no_grad():
-        # Create a test input
-        test_input = torch.randn(1, 3, 1024, 1024, dtype=torch_dtype, device=args.device)
-        try:
-            output = quantized_model_struct.module(pixel_values=test_input)
-            print("Test forward pass successful!")
-        except Exception as e:
-            print(f"Test forward pass failed: {e}")
+            quant_path = os.path.join(config.output.running_job_dirpath, "cache")
+            if config.save_model:
+                quant_path = config.save_model
 
-    print("\n" + "=" * 80)
-    print("Quantization Complete!")
-    print("=" * 80)
-    print(f"\nNext steps:")
-    print(f"1. Load quantized model from: {args.output_dir}")
-    print(f"2. Evaluate on your validation dataset")
-    print(f"3. Compare with FP16 baseline")
+            # Load state dicts
+            state_dict = torch.load(os.path.join(quant_path, "model.pt"))
+            scale_dict = torch.load(os.path.join(quant_path, "scale.pt"))
+            smooth_dict = {}
+            branch_dict = {}
+            if os.path.exists(os.path.join(quant_path, "smooth.pt")):
+                smooth_dict = torch.load(os.path.join(quant_path, "smooth.pt"))
+            if os.path.exists(os.path.join(quant_path, "branch.pt")):
+                branch_dict = torch.load(os.path.join(quant_path, "branch.pt"))
+
+            converted, other = convert_to_nunchaku_sam2_state_dicts(
+                state_dict=state_dict,
+                scale_dict=scale_dict,
+                smooth_dict=smooth_dict,
+                branch_dict=branch_dict,
+            )
+
+            import safetensors.torch
+
+            nunchaku_path = os.path.join(quant_path, "nunchaku")
+            os.makedirs(nunchaku_path, exist_ok=True)
+            safetensors.torch.save_file(converted, os.path.join(nunchaku_path, "hiera_blocks.safetensors"))
+            safetensors.torch.save_file(other, os.path.join(nunchaku_path, "unquantized_layers.safetensors"))
+            logger.info(f"Nunchaku format saved to {nunchaku_path}")
+
+    except Exception as e:
+        logger.error(f"Quantization failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    logger.info("=" * 60)
+    logger.info("Done!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

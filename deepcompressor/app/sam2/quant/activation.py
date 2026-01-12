@@ -1,146 +1,245 @@
 # -*- coding: utf-8 -*-
-"""SAM2 activation quantization utilities."""
+"""SAM2 activation quantization."""
 
+import gc
 import typing as tp
 
 import torch
-from tqdm import tqdm
+import torch.nn as nn
 
-from deepcompressor.calib import DynamicRangeCalibrator
 from deepcompressor.utils import tools
-from deepcompressor.utils.hooks import TensorsCache
 
-from ..nn.struct import Sam2ModelStruct
-from .quantizer import Sam2ActivationQuantizer
+from ..nn.struct import Sam2HieraBlockStruct, Sam2ModelStruct
+from .config import Sam2QuantConfig
 
-__all__ = ["calibrate_sam_activations", "quantize_sam_activations"]
+__all__ = ["quantize_sam2_activations"]
 
 
-def calibrate_sam_activations(
+def quantize_sam2_activations(
     model: Sam2ModelStruct,
-    quantizers: dict[str, Sam2ActivationQuantizer],
-    calib_loader: tp.Iterable,
-    num_samples: int = 128,
-) -> dict[str, tp.Any]:
-    """Calibrate SAM2 activation quantizers.
+    config: Sam2QuantConfig,
+    quantizer_state_dict: dict | None = None,
+    orig_state_dict: dict | None = None,
+) -> dict | None:
+    """Quantize SAM2 model activations.
 
     Args:
-        model (`Sam2ModelStruct`):
-            The SAM2 model structure.
-        quantizers (`dict[str, Sam2ActivationQuantizer]`):
-            Dictionary of activation quantizers for each module.
-        calib_loader (`Iterable`):
-            Calibration data loader.
-        num_samples (`int`, *optional*, defaults to 128):
-            Number of calibration samples to use.
+        model: SAM2 model structure.
+        config: Quantization configuration.
+        quantizer_state_dict: Pre-computed quantizer state dict.
+        orig_state_dict: Original model state dict.
 
     Returns:
-        `dict[str, Any]`: Calibration state dictionary.
+        Activation quantizer state dict or None.
     """
     logger = tools.logging.getLogger(__name__)
-    logger.info("Calibrating SAM2 activations...")
 
-    # Create tensor cache for collecting activations
-    cache = TensorsCache()
-    hooks = []
+    if not config.enabled_ipts and not config.enabled_opts:
+        return None
 
-    # Register forward hooks to collect activations
-    for key, module_name, module, parent_struct, field_name in model.named_key_modules():
-        if key not in quantizers:
-            continue
+    if quantizer_state_dict is None:
+        quantizer_state_dict = {}
 
-        quantizer = quantizers[key]
-        if not quantizer.is_enabled():
-            continue
+    ipts_config = config.ipts
+    opts_config = config.opts
+    develop_dtype = config.develop_dtype
 
-        # Register hook to capture inputs/outputs
-        def make_hook(quant_key):
-            def hook(mod, inp, out):
-                if isinstance(inp, tuple):
-                    inp = inp[0]
-                cache.append(quant_key, inp.detach())
-                if out is not None:
-                    cache.append(f"{quant_key}.output", out.detach())
+    for block_idx, block in enumerate(model.block_structs):
+        logger.debug(f"- Quantizing activations for block {block_idx}")
 
-            return hook
+        # Quantize attention activations
+        if block.attn_structs:
+            for attn_struct in block.attn_structs:
+                _setup_activation_quantization(
+                    attn_struct,
+                    ipts_config=ipts_config,
+                    opts_config=opts_config,
+                    develop_dtype=develop_dtype,
+                    quantizer_state_dict=quantizer_state_dict,
+                )
 
-        handle = module.register_forward_hook(make_hook(key))
-        hooks.append(handle)
+        # Quantize FFN activations
+        if block.ffn_struct is not None:
+            _setup_ffn_activation_quantization(
+                block.ffn_struct,
+                ipts_config=ipts_config,
+                opts_config=opts_config,
+                develop_dtype=develop_dtype,
+                quantizer_state_dict=quantizer_state_dict,
+            )
 
-    # Run calibration samples through the model
-    model.module.eval()
-    with torch.no_grad():
-        for idx, batch in enumerate(tqdm(calib_loader, desc="Calibrating", total=num_samples, leave=False)):
-            if idx >= num_samples:
-                break
+        gc.collect()
+        torch.cuda.empty_cache()
 
-            # Forward pass
-            if isinstance(batch, dict):
-                _ = model.module(**batch)
-            elif isinstance(batch, (list, tuple)):
-                _ = model.module(*batch)
-            else:
-                _ = model.module(batch)
-
-    # Remove hooks
-    for handle in hooks:
-        handle.remove()
-
-    logger.info("Computing optimal dynamic ranges...")
-
-    # Calibrate dynamic ranges for each quantizer
-    calib_dict = {}
-    for key, quantizer in tqdm(quantizers.items(), desc="Computing ranges", leave=False):
-        if not quantizer.is_enabled():
-            continue
-
-        if key not in cache:
-            logger.warning(f"No cached activations for {key}")
-            continue
-
-        # Get cached activations
-        activations = cache.get(key)
-
-        if quantizer.config.enabled_calib_range:
-            # Use dynamic range calibrator
-            calibrator = DynamicRangeCalibrator(config=quantizer.config.calib_range)
-            dynamic_range = calibrator.calibrate(activations, quantizer.config)
-            quantizer.dynamic_range = dynamic_range
-
-            calib_dict[key] = {
-                "dynamic_range": dynamic_range,
-            }
-
-    logger.info(f"Calibrated {len(calib_dict)} activation quantizers")
-    return calib_dict
+    return quantizer_state_dict if quantizer_state_dict else None
 
 
-def quantize_sam_activations(
-    model: Sam2ModelStruct,
-    quantizers: dict[str, Sam2ActivationQuantizer],
+def _setup_activation_quantization(
+    attn_struct,
+    *,
+    ipts_config,
+    opts_config,
+    develop_dtype: torch.dtype,
+    quantizer_state_dict: dict,
 ) -> None:
-    """Apply activation quantizers to SAM2 model.
+    """Setup activation quantization for attention modules."""
+    # QKV projections
+    if attn_struct.q_proj is not None:
+        _setup_linear_activation_quantization(
+            attn_struct.q_proj,
+            name=attn_struct.q_proj_name,
+            key=attn_struct.qkv_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
 
-    Args:
-        model (`Sam2ModelStruct`):
-            The SAM2 model structure.
-        quantizers (`dict[str, Sam2ActivationQuantizer]`):
-            Dictionary of activation quantizers for each module.
-    """
-    logger = tools.logging.getLogger(__name__)
-    logger.info("Applying activation quantizers...")
+    if attn_struct.k_proj is not None:
+        _setup_linear_activation_quantization(
+            attn_struct.k_proj,
+            name=attn_struct.k_proj_name,
+            key=attn_struct.qkv_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
 
-    # Register quantizers as hooks on modules
-    for key, module_name, module, parent_struct, field_name in model.named_key_modules():
-        if key not in quantizers:
-            continue
+    if attn_struct.v_proj is not None:
+        _setup_linear_activation_quantization(
+            attn_struct.v_proj,
+            name=attn_struct.v_proj_name,
+            key=attn_struct.qkv_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
 
-        quantizer = quantizers[key]
-        if not quantizer.is_enabled():
-            continue
+    # Output projection
+    if attn_struct.o_proj is not None:
+        _setup_linear_activation_quantization(
+            attn_struct.o_proj,
+            name=attn_struct.o_proj_name,
+            key=attn_struct.out_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
 
-        # Register quantizer as forward hook
-        hook = quantizer.as_hook()
-        module.register_forward_hook(hook)
 
-    logger.info("Activation quantizers applied")
+def _setup_ffn_activation_quantization(
+    ffn_struct,
+    *,
+    ipts_config,
+    opts_config,
+    develop_dtype: torch.dtype,
+    quantizer_state_dict: dict,
+) -> None:
+    """Setup activation quantization for FFN modules."""
+    # Up projections
+    for up_proj, up_name in zip(ffn_struct.up_projs, ffn_struct.up_proj_names):
+        _setup_linear_activation_quantization(
+            up_proj,
+            name=up_name,
+            key=ffn_struct.up_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
+
+    # Down projections
+    for down_proj, down_name in zip(ffn_struct.down_projs, ffn_struct.down_proj_names):
+        _setup_linear_activation_quantization(
+            down_proj,
+            name=down_name,
+            key=ffn_struct.down_proj_key,
+            ipts_config=ipts_config,
+            opts_config=opts_config,
+            quantizer_state_dict=quantizer_state_dict,
+        )
+
+
+def _setup_linear_activation_quantization(
+    module: nn.Linear,
+    *,
+    name: str,
+    key: str,
+    ipts_config,
+    opts_config,
+    quantizer_state_dict: dict,
+) -> None:
+    """Setup activation quantization for a linear layer."""
+    # Check skips
+    if ipts_config is not None and key in ipts_config.skips:
+        return
+    if opts_config is not None and key in opts_config.skips:
+        return
+
+    # Register activation quantization hooks
+    if ipts_config is not None and ipts_config.is_enabled():
+        if not hasattr(module, "_input_quantizer_hook"):
+            hook = module.register_forward_pre_hook(_input_quantize_hook)
+            module._input_quantizer_hook = hook
+            module._input_quant_config = ipts_config
+
+    if opts_config is not None and opts_config.is_enabled():
+        if not hasattr(module, "_output_quantizer_hook"):
+            hook = module.register_forward_hook(_output_quantize_hook)
+            module._output_quantizer_hook = hook
+            module._output_quant_config = opts_config
+
+
+def _input_quantize_hook(module: nn.Module, inputs: tuple) -> tuple:
+    """Forward pre-hook for input quantization."""
+    if not hasattr(module, "_input_quant_config"):
+        return inputs
+
+    config = module._input_quant_config
+    if not config.is_enabled():
+        return inputs
+
+    # Simple per-token quantization
+    x = inputs[0]
+    if config.quant_dtype is not None:
+        bits = config.quant_dtype.bits
+        qmin = -(2 ** (bits - 1))
+        qmax = 2 ** (bits - 1) - 1
+
+        # Per-token scale
+        scale = x.abs().max(dim=-1, keepdim=True)[0] / qmax
+        scale = scale.clamp(min=1e-8)
+
+        # Quantize and dequantize
+        x_q = (x / scale).round().clamp(qmin, qmax)
+        x_dq = x_q * scale
+
+        return (x_dq,) + inputs[1:]
+
+    return inputs
+
+
+def _output_quantize_hook(module: nn.Module, inputs: tuple, output: torch.Tensor) -> torch.Tensor:
+    """Forward hook for output quantization."""
+    if not hasattr(module, "_output_quant_config"):
+        return output
+
+    config = module._output_quant_config
+    if not config.is_enabled():
+        return output
+
+    # Simple per-token quantization
+    if config.quant_dtype is not None:
+        bits = config.quant_dtype.bits
+        qmin = -(2 ** (bits - 1))
+        qmax = 2 ** (bits - 1) - 1
+
+        # Per-token scale
+        scale = output.abs().max(dim=-1, keepdim=True)[0] / qmax
+        scale = scale.clamp(min=1e-8)
+
+        # Quantize and dequantize
+        y_q = (output / scale).round().clamp(qmin, qmax)
+        y_dq = y_q * scale
+
+        return y_dq
+
+    return output

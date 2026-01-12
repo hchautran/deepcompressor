@@ -1,81 +1,55 @@
 # SAM2 Hiera-Large W4A8 with SVDQuant Configuration
-# 4-bit weights with low-rank compensation, 8-bit activations for facebook/sam2-hiera-large
+# 4-bit weights with low-rank compensation, 8-bit activations
+
+model:
+  name: large
+  device: cuda
+  dtype: float16
+
+cache:
+  root: ./cache/sam2
 
 quant:
   calib:
-    num_samples: 256              # More samples for large model
+    path: /path/to/coco/val2017
+    num_samples: 256
     batch_size: 1
+    image_size: 1024
+    seed: 42
 
   wgts:
     dtype: uint4
-    zero_point: PostScale
-    static: true
-    group_shapes:
-      - [1, 128]
-    scale_dtypes:
-      - torch.float16
-
+    group_shapes: [[1, 128]]
     kernel_gptq:
       damp_percentage: 0.01
       block_size: 128
       num_inv_tries: 250
-      hessian_block_size: 512
-
-    # SVDQuant: Low-rank branch for outlier compensation
     low_rank:
-      rank: 64                      # Higher rank for large model
-      compensate: true              # Compensate for quantization error
-      exclusive: false              # Share low-rank across tensors
-      skips: []
-
-    skip_patch_embed: true
-    skip_first_block: false
-    skip_last_block: false
-    skip_decoder: false
-
-    calib_range:
-      objective: TensorError
-      strategy: GridSearch
-      granularity: Group
-      degree: 2.4
-      num_grids: 100
+      rank: 32
+      exclusive: false
 
   ipts:
     dtype: uint8
-    zero_point: PostScale
+    group_shapes: [[1, -1]]
     static: false
-    per_token: true
-    group_shapes:
-      - [1, -1]
-    scale_dtypes:
-      - torch.float16
-
-    calib_range:
-      objective: TensorError
-      strategy: GridSearch
-      granularity: Group
-      degree: 2.4
-      num_grids: 100
 
   opts:
-    dtype: uint8
-    zero_point: PostScale
-    static: false
-    per_token: true
-    group_shapes:
-      - [1, -1]
-    scale_dtypes:
-      - torch.float16
-
-    calib_range:
-      objective: TensorError
-      strategy: GridSearch
-      granularity: Group
-      degree: 2.4
-      num_grids: 100
-
-  rotation:
-    enabled: false
+    dtype: null
 
   smooth:
-    enabled: false
+    proj:
+      granularity: Layer
+      strategy: GridSearch
+      num_grids: 20
+      alpha: 0.5
+
+  rotation:
+    transforms: [hadamard]
+    random: false
+
+output:
+  root: ./outputs/sam2
+  job: hiera_large_w4a8_svdquant
+
+save_model: true
+seed: 42
