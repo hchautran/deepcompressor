@@ -11,6 +11,7 @@ from deepcompressor.utils import tools
 
 from ..nn.struct import Sam2HieraBlockStruct, Sam2ModelStruct
 from .config import Sam2QuantConfig
+from .utils import ActivationStatsCollector
 
 __all__ = ["quantize_sam2_activations"]
 
@@ -20,6 +21,7 @@ def quantize_sam2_activations(
     config: Sam2QuantConfig,
     quantizer_state_dict: dict | None = None,
     orig_state_dict: dict | None = None,
+    activation_stats: ActivationStatsCollector | None = None,
 ) -> dict | None:
     """Quantize SAM2 model activations.
 
@@ -28,6 +30,7 @@ def quantize_sam2_activations(
         config: Quantization configuration.
         quantizer_state_dict: Pre-computed quantizer state dict.
         orig_state_dict: Original model state dict.
+        activation_stats: Activation statistics from calibration data.
 
     Returns:
         Activation quantizer state dict or None.
@@ -44,6 +47,10 @@ def quantize_sam2_activations(
     opts_config = config.opts
     develop_dtype = config.develop_dtype
 
+    # Log if we have activation stats
+    if activation_stats is not None:
+        logger.info("Using calibration activation statistics for activation quantization")
+
     for block_idx, block in enumerate(model.block_structs):
         logger.debug(f"- Quantizing activations for block {block_idx}")
 
@@ -56,6 +63,7 @@ def quantize_sam2_activations(
                     opts_config=opts_config,
                     develop_dtype=develop_dtype,
                     quantizer_state_dict=quantizer_state_dict,
+                    activation_stats=activation_stats,
                 )
 
         # Quantize FFN activations
@@ -66,6 +74,7 @@ def quantize_sam2_activations(
                 opts_config=opts_config,
                 develop_dtype=develop_dtype,
                 quantizer_state_dict=quantizer_state_dict,
+                activation_stats=activation_stats,
             )
 
         gc.collect()
@@ -81,6 +90,7 @@ def _setup_activation_quantization(
     opts_config,
     develop_dtype: torch.dtype,
     quantizer_state_dict: dict,
+    activation_stats: ActivationStatsCollector | None = None,
 ) -> None:
     """Setup activation quantization for attention modules."""
     # QKV projections
@@ -92,6 +102,7 @@ def _setup_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
     if attn_struct.k_proj is not None:
@@ -102,6 +113,7 @@ def _setup_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
     if attn_struct.v_proj is not None:
@@ -112,6 +124,7 @@ def _setup_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
     # Output projection
@@ -123,6 +136,7 @@ def _setup_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
 
@@ -133,6 +147,7 @@ def _setup_ffn_activation_quantization(
     opts_config,
     develop_dtype: torch.dtype,
     quantizer_state_dict: dict,
+    activation_stats: ActivationStatsCollector | None = None,
 ) -> None:
     """Setup activation quantization for FFN modules."""
     # Up projections
@@ -144,6 +159,7 @@ def _setup_ffn_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
     # Down projections
@@ -155,6 +171,7 @@ def _setup_ffn_activation_quantization(
             ipts_config=ipts_config,
             opts_config=opts_config,
             quantizer_state_dict=quantizer_state_dict,
+            activation_stats=activation_stats,
         )
 
 
@@ -166,6 +183,7 @@ def _setup_linear_activation_quantization(
     ipts_config,
     opts_config,
     quantizer_state_dict: dict,
+    activation_stats: ActivationStatsCollector | None = None,
 ) -> None:
     """Setup activation quantization for a linear layer."""
     # Check skips
@@ -174,6 +192,28 @@ def _setup_linear_activation_quantization(
     if opts_config is not None and key in opts_config.skips:
         return
 
+    # Get static scales from activation stats if available and static mode is enabled
+    input_static_scale = None
+    output_static_scale = None
+
+    if activation_stats is not None:
+        if ipts_config is not None and ipts_config.static:
+            input_static_scale = activation_stats.get_input_scale(name)
+            if input_static_scale is not None:
+                # Store in quantizer state dict
+                quantizer_state_dict[f"{name}.input_scale"] = input_static_scale.cpu()
+
+        if opts_config is not None and opts_config.static:
+            output_static_scale = activation_stats.get_output_scale(name)
+            if output_static_scale is not None:
+                quantizer_state_dict[f"{name}.output_scale"] = output_static_scale.cpu()
+    else:
+        # Try to load from quantizer state dict
+        if f"{name}.input_scale" in quantizer_state_dict:
+            input_static_scale = quantizer_state_dict[f"{name}.input_scale"]
+        if f"{name}.output_scale" in quantizer_state_dict:
+            output_static_scale = quantizer_state_dict[f"{name}.output_scale"]
+
     # Register activation quantization hooks
     if ipts_config is not None and ipts_config.is_enabled():
         if not hasattr(module, "_input_quantizer_hook"):
@@ -181,11 +221,19 @@ def _setup_linear_activation_quantization(
             module._input_quantizer_hook = hook
             module._input_quant_config = ipts_config
 
+            # Store static scale if available
+            if input_static_scale is not None:
+                module.register_buffer("_input_static_scale", input_static_scale.to(module.weight.device))
+
     if opts_config is not None and opts_config.is_enabled():
         if not hasattr(module, "_output_quantizer_hook"):
             hook = module.register_forward_hook(_output_quantize_hook)
             module._output_quantizer_hook = hook
             module._output_quant_config = opts_config
+
+            # Store static scale if available
+            if output_static_scale is not None:
+                module.register_buffer("_output_static_scale", output_static_scale.to(module.weight.device))
 
 
 def _input_quantize_hook(module: nn.Module, inputs: tuple) -> tuple:
@@ -197,15 +245,24 @@ def _input_quantize_hook(module: nn.Module, inputs: tuple) -> tuple:
     if not config.is_enabled():
         return inputs
 
-    # Simple per-token quantization
     x = inputs[0]
     if config.quant_dtype is not None:
         bits = config.quant_dtype.bits
         qmin = -(2 ** (bits - 1))
         qmax = 2 ** (bits - 1) - 1
 
-        # Per-token scale
-        scale = x.abs().max(dim=-1, keepdim=True)[0] / qmax
+        # Check for static scale
+        if config.static and hasattr(module, "_input_static_scale"):
+            scale = module._input_static_scale
+            # Broadcast scale to match input shape
+            while scale.dim() < x.dim():
+                scale = scale.unsqueeze(0)
+            scale = scale.expand_as(x)
+            scale = scale / qmax
+        else:
+            # Dynamic per-token scale
+            scale = x.abs().max(dim=-1, keepdim=True)[0] / qmax
+
         scale = scale.clamp(min=1e-8)
 
         # Quantize and dequantize
@@ -226,14 +283,23 @@ def _output_quantize_hook(module: nn.Module, inputs: tuple, output: torch.Tensor
     if not config.is_enabled():
         return output
 
-    # Simple per-token quantization
     if config.quant_dtype is not None:
         bits = config.quant_dtype.bits
         qmin = -(2 ** (bits - 1))
         qmax = 2 ** (bits - 1) - 1
 
-        # Per-token scale
-        scale = output.abs().max(dim=-1, keepdim=True)[0] / qmax
+        # Check for static scale
+        if config.static and hasattr(module, "_output_static_scale"):
+            scale = module._output_static_scale
+            # Broadcast scale to match output shape
+            while scale.dim() < output.dim():
+                scale = scale.unsqueeze(0)
+            scale = scale.expand_as(output)
+            scale = scale / qmax
+        else:
+            # Dynamic per-token scale
+            scale = output.abs().max(dim=-1, keepdim=True)[0] / qmax
+
         scale = scale.clamp(min=1e-8)
 
         # Quantize and dequantize

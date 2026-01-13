@@ -8,8 +8,7 @@ import torch
 from omniconfig import configclass
 
 from deepcompressor.utils import tools
-from deepcompressor.utils.config.output import  OutputConfig
-# from deepcompressor.utils.config import FieldRegistry, OutputConfig
+from deepcompressor.utils.config.output import OutputConfig
 
 from .cache.config import Sam2PtqCacheConfig
 from .nn.struct import Sam2ModelStruct
@@ -74,7 +73,6 @@ class Sam2ModelConfig:
         logger = tools.logging.getLogger(__name__)
         logger.info(f"Loading SAM2 model from {self.path}")
 
-        # try:
         from transformers import Sam2Model, Sam2Processor
 
         model = Sam2Model.from_pretrained(
@@ -88,13 +86,6 @@ class Sam2ModelConfig:
         model_struct = Sam2ModelStruct.construct(model)
 
         return model, processor, model_struct
-
-        # except ImportError as e:
-            # logger.error(f"Failed to import transformers: {e}")
-            # raise
-        # except Exception as e:
-            # logger.error(f"Failed to load model: {e}")
-            # raise
 
 
 @configclass
@@ -143,6 +134,33 @@ class Sam2PtqRunConfig:
         else:
             self.cache.dirpath = self.cache.path = None
 
+    def build_calib_dataloader(self):
+        """Build the calibration dataloader from config.
+
+        Returns:
+            DataLoader or None if no calibration path is configured.
+        """
+        logger = tools.logging.getLogger(__name__)
+
+        if not hasattr(self.quant, 'calib') or self.quant.calib is None:
+            return None
+
+        calib_config = self.quant.calib
+        if not calib_config.path:
+            logger.warning("No calibration path configured")
+            return None
+
+        if not os.path.exists(calib_config.path):
+            logger.warning(f"Calibration path does not exist: {calib_config.path}")
+            return None
+
+        logger.info(f"Building calibration dataloader from {calib_config.path}")
+        logger.info(f"  - num_samples: {calib_config.num_samples}")
+        logger.info(f"  - batch_size: {calib_config.batch_size}")
+        logger.info(f"  - image_size: {calib_config.image_size}")
+
+        return calib_config.build_dataloader()
+
     def main(self) -> None:
         """Run the PTQ pipeline."""
         from .ptq import ptq
@@ -154,6 +172,14 @@ class Sam2PtqRunConfig:
         model, processor, model_struct = self.model.build()
 
         logger.info(f"Model has {model_struct.num_blocks} blocks")
+
+        # Build calibration dataloader
+        logger.info("=== Building Calibration DataLoader ===")
+        calib_dataloader = self.build_calib_dataloader()
+        if calib_dataloader is not None:
+            logger.info(f"Calibration dataloader ready with {len(calib_dataloader)} batches")
+        else:
+            logger.warning("No calibration dataloader available - using weight-based approximation")
 
         # Run PTQ
         logger.info("=== Running Post-Training Quantization ===")
@@ -179,6 +205,7 @@ class Sam2PtqRunConfig:
             model_struct,
             self.quant,
             cache=self.cache,
+            calib_dataloader=calib_dataloader,
             load_dirpath=self.load_from,
             save_dirpath=save_dirpath if save_dirpath else os.path.join(self.output.running_job_dirpath, "cache"),
             copy_on_save=self.copy_on_save,
@@ -195,9 +222,3 @@ class Sam2PtqRunConfig:
         from omniconfig import OmniConfig
 
         return OmniConfig.from_dataclass(cls)
-
-
-# Register field converters
-# FieldRegistry.register("Sam2ModelConfig", Sam2ModelConfig)
-# FieldRegistry.register("Sam2QuantConfig", Sam2QuantConfig)
-# FieldRegistry.register("Sam2PtqCacheConfig", Sam2PtqCacheConfig)

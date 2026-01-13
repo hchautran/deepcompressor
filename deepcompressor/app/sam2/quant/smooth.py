@@ -10,6 +10,7 @@ from deepcompressor.utils import tools
 
 from ..nn.struct import Sam2ModelStruct
 from .config import Sam2QuantConfig
+from .utils import ActivationStatsCollector
 
 __all__ = ["smooth_sam2"]
 
@@ -18,6 +19,7 @@ def smooth_sam2(
     model: Sam2ModelStruct,
     config: Sam2QuantConfig,
     smooth_cache: dict | None = None,
+    activation_stats: ActivationStatsCollector | None = None,
 ) -> dict:
     """Apply smooth quantization to SAM2 model.
 
@@ -28,6 +30,7 @@ def smooth_sam2(
         model: SAM2 model structure.
         config: Quantization configuration.
         smooth_cache: Pre-computed smooth scales.
+        activation_stats: Activation statistics from calibration data.
 
     Returns:
         Dictionary of smooth scales.
@@ -44,8 +47,12 @@ def smooth_sam2(
         return {}
 
     logger.info("Computing smooth scales")
-    smooth_cache = {}
+    if activation_stats is not None:
+        logger.info("- Using calibration activation statistics")
+    else:
+        logger.info("- Using weight-based approximation (no calibration data)")
 
+    smooth_cache = {}
     smooth_config = config.smooth
 
     for block_idx, block in enumerate(model.block_structs):
@@ -58,10 +65,16 @@ def smooth_sam2(
                 if block.pre_attn_norms and attn_struct.q_proj is not None:
                     norm = block.pre_attn_norms[0] if block.pre_attn_norms else None
                     if norm is not None:
+                        # Get activation scale from calibration data or fallback to weight proxy
+                        act_scale = None
+                        if activation_stats is not None:
+                            act_scale = activation_stats.get_input_scale(attn_struct.q_proj_name)
+
                         scales = _compute_smooth_scales(
                             norm,
                             [attn_struct.q_proj],
                             config=smooth_config.proj,
+                            act_scale=act_scale,
                         )
                         key = f"{attn_struct.q_proj_name}.smooth"
                         smooth_cache[key] = scales
@@ -77,18 +90,57 @@ def smooth_sam2(
                             smooth_cache[key] = scales
                             _apply_smooth_to_layers(None, [attn_struct.v_proj], scales)
 
+                # Smooth output projection
+                if attn_struct.o_proj is not None:
+                    act_scale = None
+                    if activation_stats is not None:
+                        act_scale = activation_stats.get_input_scale(attn_struct.o_proj_name)
+
+                    # For o_proj, we don't have a preceding norm, use activation-only smoothing
+                    if act_scale is not None:
+                        scales = _compute_smooth_scales_activation_only(
+                            attn_struct.o_proj,
+                            act_scale=act_scale,
+                            config=smooth_config.proj,
+                        )
+                        key = f"{attn_struct.o_proj_name}.smooth"
+                        smooth_cache[key] = scales
+                        _apply_smooth_to_layers(None, [attn_struct.o_proj], scales)
+
         # Smooth FFN modules
         if smooth_config.enabled_proj and block.ffn_struct is not None:
             if block.pre_ffn_norm is not None:
                 for up_proj, up_name in zip(block.ffn_struct.up_projs, block.ffn_struct.up_proj_names):
+                    # Get activation scale from calibration data
+                    act_scale = None
+                    if activation_stats is not None:
+                        act_scale = activation_stats.get_input_scale(up_name)
+
                     scales = _compute_smooth_scales(
                         block.pre_ffn_norm,
                         [up_proj],
                         config=smooth_config.proj,
+                        act_scale=act_scale,
                     )
                     key = f"{up_name}.smooth"
                     smooth_cache[key] = scales
                     _apply_smooth_to_layers(block.pre_ffn_norm, [up_proj], scales)
+
+            # Smooth down projections
+            for down_proj, down_name in zip(block.ffn_struct.down_projs, block.ffn_struct.down_proj_names):
+                act_scale = None
+                if activation_stats is not None:
+                    act_scale = activation_stats.get_input_scale(down_name)
+
+                if act_scale is not None:
+                    scales = _compute_smooth_scales_activation_only(
+                        down_proj,
+                        act_scale=act_scale,
+                        config=smooth_config.proj,
+                    )
+                    key = f"{down_name}.smooth"
+                    smooth_cache[key] = scales
+                    _apply_smooth_to_layers(None, [down_proj], scales)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -101,6 +153,7 @@ def _compute_smooth_scales(
     modules: list[nn.Linear],
     *,
     config,
+    act_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute smooth scales for a normalization layer and its consumers.
 
@@ -108,6 +161,7 @@ def _compute_smooth_scales(
         norm: Normalization layer (LayerNorm).
         modules: List of linear modules consuming the norm output.
         config: Smooth configuration.
+        act_scale: Per-channel activation scale from calibration (abs_max).
 
     Returns:
         Smooth scales tensor.
@@ -126,11 +180,49 @@ def _compute_smooth_scales(
     # Combine weight scales
     weight_scale = torch.stack(weight_scales).max(dim=0)[0]
 
-    # Get activation scale from norm (use norm weight as proxy)
-    if hasattr(norm, "weight") and norm.weight is not None:
+    # Get activation scale
+    if act_scale is not None:
+        # Use calibration data activation scale
+        act_scale = act_scale.to(weight_scale.device)
+    elif hasattr(norm, "weight") and norm.weight is not None:
+        # Fallback: use norm weight as proxy
         act_scale = norm.weight.data.abs()
     else:
         act_scale = torch.ones_like(weight_scale)
+
+    # Compute smooth scale: s = (act_scale / weight_scale)^alpha
+    alpha = config.alpha if hasattr(config, "alpha") else 0.5
+    eps = 1e-8
+
+    smooth_scale = (act_scale / (weight_scale + eps)).pow(alpha)
+    smooth_scale = smooth_scale.clamp(min=eps, max=1.0 / eps)
+
+    return smooth_scale
+
+
+def _compute_smooth_scales_activation_only(
+    module: nn.Linear,
+    *,
+    act_scale: torch.Tensor,
+    config,
+) -> torch.Tensor:
+    """Compute smooth scales using only activation statistics.
+
+    Used for layers without a preceding normalization (e.g., o_proj, down_proj).
+
+    Args:
+        module: Linear module to smooth.
+        act_scale: Per-channel activation scale from calibration (abs_max).
+        config: Smooth configuration.
+
+    Returns:
+        Smooth scales tensor.
+    """
+    # Get weight scale
+    w = module.weight.data.abs()
+    weight_scale = w.max(dim=0)[0]  # Per-input-channel max
+
+    act_scale = act_scale.to(weight_scale.device)
 
     # Compute smooth scale: s = (act_scale / weight_scale)^alpha
     alpha = config.alpha if hasattr(config, "alpha") else 0.5
