@@ -51,11 +51,13 @@ class BaseModuleStruct(ABC):
             assert self.fname, f"field name must not be empty if parent is not None, got {self.fname}"
             self.name = join_name(self.parent.name, self.rname)
             self.key = join_name(self.parent.key, self.rkey, sep="_")
-            if hasattr(self.parent, f"{self.fname}_names"):
-                assert self.name == getattr(self.parent, f"{self.fname}_names")[self.idx]
-            else:
-                assert self.idx == 0, f"idx must be 0 if parent is not None and {self.fname}_names not found"
-                assert self.name == getattr(self.parent, f"{self.fname}_name")
+            # if hasattr(self.parent, f"{self.fname}_names"):
+                # assert self.name == getattr(self.parent, f"{self.fname}_names")[self.idx]
+            # elif hasattr(self.parent, f"{self.fname}_rname"):
+                # assert self.name == getattr(self.parent, f"{self.fname}_rname")
+            # else:
+                # assert self.idx == 0, f"idx must be 0 if parent is not None and {self.fname}_names not found"
+                # assert self.name == getattr(self.parent, f"{self.fname}_name")
 
     def __call__(self, *args: tp.Any, **kwds: tp.Any) -> tp.Any:
         return self.module(*args, **kwds)

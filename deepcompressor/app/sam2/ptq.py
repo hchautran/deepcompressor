@@ -235,6 +235,7 @@ def ptq(
     if quant_acts:
         logger.info("* Quantizing activations")
         tools.logging.Formatter.indent_inc()
+        breakpoint()
         if config.needs_acts_quantizer_cache:
             load_from = ""
             if load_path and os.path.exists(load_path.acts):

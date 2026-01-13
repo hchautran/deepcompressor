@@ -141,6 +141,11 @@ class QuantDataType:
         return self.__total_bits
 
     @property
+    def bits(self) -> int:
+        """Alias for total_bits."""
+        return self.__total_bits
+
+    @property
     def exponent_bits(self) -> int:
         """Number of bits for the exponent."""
         return self.__exponent_bits

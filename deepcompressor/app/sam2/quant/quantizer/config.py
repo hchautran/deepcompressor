@@ -70,6 +70,12 @@ class Sam2QuantizerConfig(QuantizerConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if isinstance(self.kernel_gptq, dict):
+            self.kernel_gptq = Sam2GPTQConfig(**self.kernel_gptq)
+        if isinstance(self.low_rank, dict):
+            self.low_rank = SkipBasedQuantLowRankCalibConfig(**self.low_rank)
+        if isinstance(self.calib_range, dict):
+            self.calib_range = SkipBasedDynamicRangeCalibConfig(**self.calib_range)
         if self.quant_dtype is None:
             self.static = False
             self.kernel_gptq = None

@@ -173,3 +173,5 @@ runs/
 exps/
 wandb
 wandb/
+data/
+data

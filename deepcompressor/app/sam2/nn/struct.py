@@ -6,6 +6,14 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 
 import torch.nn as nn
+from transformers.models.sam2.modeling_sam2 import (
+    Sam2Model,
+    Sam2VisionModel, 
+    Sam2HieraDetModel,
+    Sam2MultiScaleBlock,
+    Sam2MultiScaleAttention,
+    Sam2FeedForward
+)
 
 from deepcompressor.nn.struct.attn import (
     AttentionConfigStruct,
@@ -13,6 +21,7 @@ from deepcompressor.nn.struct.attn import (
     FeedForwardConfigStruct,
     FeedForwardStruct,
     TransformerBlockStruct,
+    
 )
 from deepcompressor.nn.struct.base import BaseModuleStruct
 from deepcompressor.utils.common import join_name
@@ -48,6 +57,31 @@ class Sam2AttentionStruct(AttentionStruct):
 
     module: nn.Module = field(repr=False, kw_only=False)
     parent: tp.Optional["Sam2HieraBlockStruct"] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        BaseModuleStruct.__post_init__(self)
+        for field_name in (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "q",
+            "k",
+            "v",
+        ):
+            rname = getattr(self, f"{field_name}_rname")
+            if getattr(self, field_name) is not None or rname:
+                assert rname, f"`{field_name}_rname` must not be empty if `{field_name}` is not None"
+                setattr(self, f"{field_name}_name", join_name(self.name, rname))
+            else:
+                setattr(self, f"{field_name}_name", "")
+        self.qkv_proj_key = join_name(self.key, self.qkv_proj_rkey, sep="_")
+        self.add_qkv_proj_key = join_name(self.key, self.add_qkv_proj_rkey, sep="_")
+        self.out_proj_key = join_name(self.key, self.out_proj_rkey, sep="_")
+        self.add_out_proj_key = join_name(self.key, self.add_out_proj_rkey, sep="_")
+        self.q_key = join_name(self.key, self.q_rkey, sep="_")
+        self.k_key = join_name(self.key, self.k_rkey, sep="_")
+        self.v_key = join_name(self.key, self.v_rkey, sep="_")
 
     @staticmethod
     def _default_construct(
@@ -688,9 +722,15 @@ class Sam2ModelStruct(BaseModuleStruct):
 
 
 # Register factories
-Sam2AttentionStruct.register_factory(nn.Module, Sam2AttentionStruct._default_construct)
-Sam2FeedForwardStruct.register_factory(nn.Module, Sam2FeedForwardStruct._default_construct)
-Sam2HieraBlockStruct.register_factory(nn.Module, Sam2HieraBlockStruct._default_construct)
-Sam2HieraStruct.register_factory(nn.Module, Sam2HieraStruct._default_construct)
-Sam2VisionEncoderStruct.register_factory(nn.Module, Sam2VisionEncoderStruct._default_construct)
-Sam2ModelStruct.register_factory(nn.Module, Sam2ModelStruct._default_construct)
+    # Sam2Model,
+    # Sam2VisionModel, 
+    # Sam2HieraDetModel,
+    # Sam2MultiScaleBlock,
+    # Sam2MultiScaleAttention,
+    # Sam2FeedForward
+Sam2AttentionStruct.register_factory(Sam2MultiScaleAttention, Sam2AttentionStruct._default_construct)
+Sam2FeedForwardStruct.register_factory(Sam2FeedForward, Sam2FeedForwardStruct._default_construct)
+Sam2HieraBlockStruct.register_factory(Sam2MultiScaleBlock, Sam2HieraBlockStruct._default_construct)
+Sam2HieraStruct.register_factory(Sam2HieraDetModel, Sam2HieraStruct._default_construct)
+Sam2VisionEncoderStruct.register_factory(Sam2VisionModel, Sam2VisionEncoderStruct._default_construct)
+Sam2ModelStruct.register_factory(Sam2Model, Sam2ModelStruct._default_construct)

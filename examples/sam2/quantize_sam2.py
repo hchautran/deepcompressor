@@ -13,7 +13,7 @@ Usage:
         --model.name tiny \
         --quant.wgts.dtype uint4 \
         --quant.ipts.dtype uint8 \
-        --quant.calib.path /path/to/coco/val2017 \
+        --quant.calib.path ../../coco/val2017 \
         --output.root ./outputs/sam2
 
 Supported model variants:
@@ -36,7 +36,6 @@ For best accuracy, enable:
 import argparse
 import sys
 import traceback
-
 import torch
 
 
@@ -179,7 +178,7 @@ def main():
             Sam2ActivationQuantizerConfig,
         )
         from deepcompressor.app.sam2.dataset.calib import Sam2CalibConfig
-        from deepcompressor.utils.config import OutputConfig
+        from deepcompressor.utils.config.output import OutputConfig
 
         # Build sub-configs
         model_config = Sam2ModelConfig(**config_dict.get("model", {}))
@@ -241,8 +240,18 @@ def main():
             import os
 
             quant_path = os.path.join(config.output.running_job_dirpath, "cache")
-            if config.save_model:
-                quant_path = config.save_model
+            save_model = config.save_model
+            if save_model:
+                if isinstance(save_model, str):
+                    save_model_value = save_model.lower()
+                else:
+                    save_model_value = save_model
+                if save_model_value in ("false", "none", "null", "nil", False):
+                    pass
+                elif save_model_value in ("true", "default", True):
+                    quant_path = os.path.join(config.output.running_job_dirpath, "model")
+                else:
+                    quant_path = save_model
 
             # Load state dicts
             state_dict = torch.load(os.path.join(quant_path, "model.pt"))

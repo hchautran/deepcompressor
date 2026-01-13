@@ -11,7 +11,7 @@ cache:
 
 quant:
   calib:
-    path: /path/to/coco/val2017
+    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/coco/val2017
     num_samples: 256
     batch_size: 1
     image_size: 1024

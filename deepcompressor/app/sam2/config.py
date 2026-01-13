@@ -8,7 +8,8 @@ import torch
 from omniconfig import configclass
 
 from deepcompressor.utils import tools
-from deepcompressor.utils.config import FieldRegistry, OutputConfig
+from deepcompressor.utils.config.output import  OutputConfig
+# from deepcompressor.utils.config import FieldRegistry, OutputConfig
 
 from .cache.config import Sam2PtqCacheConfig
 from .nn.struct import Sam2ModelStruct
@@ -73,27 +74,27 @@ class Sam2ModelConfig:
         logger = tools.logging.getLogger(__name__)
         logger.info(f"Loading SAM2 model from {self.path}")
 
-        try:
-            from transformers import Sam2Model, Sam2Processor
+        # try:
+        from transformers import Sam2Model, Sam2Processor
 
-            model = Sam2Model.from_pretrained(
-                self.path,
-                torch_dtype=self.torch_dtype,
-            ).to(self.device)
-            model.eval()
+        model = Sam2Model.from_pretrained(
+            self.path,
+            torch_dtype=self.torch_dtype,
+        ).to(self.device)
+        model.eval()
 
-            processor = Sam2Processor.from_pretrained(self.path)
+        processor = Sam2Processor.from_pretrained(self.path)
 
-            model_struct = Sam2ModelStruct.construct(model)
+        model_struct = Sam2ModelStruct.construct(model)
 
-            return model, processor, model_struct
+        return model, processor, model_struct
 
-        except ImportError as e:
-            logger.error(f"Failed to import transformers: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            raise
+        # except ImportError as e:
+            # logger.error(f"Failed to import transformers: {e}")
+            # raise
+        # except Exception as e:
+            # logger.error(f"Failed to load model: {e}")
+            # raise
 
 
 @configclass
@@ -134,6 +135,13 @@ class Sam2PtqRunConfig:
         torch.manual_seed(self.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.seed)
+        if self.quant.is_enabled():
+            self.cache.dirpath = self.quant.generate_cache_dirpath(
+                root=self.cache.root, default_dtype=self.model.torch_dtype
+            )
+            self.cache.path = self.cache.dirpath.clone().add_children(f"{self.model.name}.pt")
+        else:
+            self.cache.dirpath = self.cache.path = None
 
     def main(self) -> None:
         """Run the PTQ pipeline."""
@@ -152,9 +160,13 @@ class Sam2PtqRunConfig:
 
         save_dirpath = ""
         if self.save_model:
-            if self.save_model.lower() in ("false", "none", "null", "nil"):
+            if isinstance(self.save_model, str):
+                save_model_value = self.save_model.lower()
+            else:
+                save_model_value = self.save_model
+            if save_model_value in ("false", "none", "null", "nil", False):
                 save_model = False
-            elif self.save_model.lower() in ("true", "default"):
+            elif save_model_value in ("true", "default", True):
                 save_dirpath = os.path.join(self.output.running_job_dirpath, "model")
                 save_model = True
             else:
@@ -186,6 +198,6 @@ class Sam2PtqRunConfig:
 
 
 # Register field converters
-FieldRegistry.register("Sam2ModelConfig", Sam2ModelConfig)
-FieldRegistry.register("Sam2QuantConfig", Sam2QuantConfig)
-FieldRegistry.register("Sam2PtqCacheConfig", Sam2PtqCacheConfig)
+# FieldRegistry.register("Sam2ModelConfig", Sam2ModelConfig)
+# FieldRegistry.register("Sam2QuantConfig", Sam2QuantConfig)
+# FieldRegistry.register("Sam2PtqCacheConfig", Sam2PtqCacheConfig)
