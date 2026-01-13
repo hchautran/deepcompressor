@@ -215,12 +215,83 @@ quant:
       exclusive: false
 ```
 
+## Validating Quantized Models
+
+After quantization, validate the model quality by comparing outputs with the original model.
+
+### Quick Validation
+
+```bash
+python validate_sam2.py \
+    --original facebook/sam2.1-hiera-tiny \
+    --quantized ./outputs/sam2/hiera_tiny_w4a8/model \
+    --images /path/to/validation/images \
+    --num-samples 32
+```
+
+### Full Validation with Layer Comparison
+
+```bash
+python validate_sam2.py \
+    --original facebook/sam2.1-hiera-tiny \
+    --quantized ./outputs/sam2/hiera_tiny_w4a8/model \
+    --images /path/to/coco/val2017 \
+    --num-samples 100 \
+    --compare-layers \
+    --save-report validation_report.json
+```
+
+### Validation Metrics
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| Cosine Similarity | Similarity between original and quantized outputs | >= 0.95 |
+| SNR (dB) | Signal-to-Noise Ratio | >= 20 dB |
+| MSE | Mean Squared Error | Lower is better |
+| MAE | Mean Absolute Error | Lower is better |
+
+### Quality Interpretation
+
+| Cosine Similarity | Quality | Recommendation |
+|-------------------|---------|----------------|
+| >= 0.99 | Excellent | Ready for production |
+| 0.95 - 0.99 | Good | Suitable for most use cases |
+| 0.90 - 0.95 | Acceptable | May need fine-tuning for sensitive tasks |
+| 0.80 - 0.90 | Fair | Consider less aggressive quantization |
+| < 0.80 | Poor | Increase calibration samples or reduce quantization |
+
+### Programmatic Validation
+
+```python
+from deepcompressor.app.sam2 import validate_quantization
+from deepcompressor.app.sam2.dataset.calib import Sam2CalibConfig
+
+# Build dataloader
+calib_config = Sam2CalibConfig(
+    path="/path/to/images",
+    num_samples=32,
+)
+dataloader = calib_config.build_dataloader()
+
+# Validate
+result = validate_quantization(
+    original_model=original_model,
+    quantized_model=quantized_model,
+    dataloader=dataloader,
+    compare_intermediate=True,
+)
+
+print(f"Cosine Similarity: {result.cosine_similarity:.4f}")
+print(f"SNR: {result.snr_db:.2f} dB")
+```
+
 ## Tips for Best Results
 
 1. **Use more calibration samples** for larger models (256+ for large)
 2. **Enable smooth quantization** for W4A8 configurations
 3. **Use SVDQuant** for W4A4 to maintain accuracy
 4. **Enable rotation** when using aggressive quantization (W4A4)
+5. **Validate after quantization** to ensure quality meets requirements
 
 ## Troubleshooting
 

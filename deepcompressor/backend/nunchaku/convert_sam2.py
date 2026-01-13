@@ -17,6 +17,9 @@ __all__ = [
 ]
 
 
+DEFAULT_LORA_RANK = 32
+
+
 def convert_to_nunchaku_sam2_linear_state_dict(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -26,6 +29,7 @@ def convert_to_nunchaku_sam2_linear_state_dict(
     smooth_fused: bool = False,
     float_point: bool = False,
     subscale: torch.Tensor | None = None,
+    default_lora_rank: int = DEFAULT_LORA_RANK,
 ) -> dict[str, torch.Tensor]:
     """Convert a linear layer to nunchaku format.
 
@@ -38,9 +42,17 @@ def convert_to_nunchaku_sam2_linear_state_dict(
         smooth_fused: Whether smooth is fused.
         float_point: Whether to use float-point 4-bit.
         subscale: Optional subscale tensor.
+        default_lora_rank: Default low-rank dimension when lora is None.
 
     Returns:
-        Dictionary with nunchaku format tensors.
+        Dictionary with nunchaku format tensors compatible with SVDQW4A4Linear:
+        - qweight: Packed quantized weights (int8)
+        - wscales/wcscales/wtscale: Weight scales (bf16/fp16)
+        - bias: Bias tensor (bf16/fp16)
+        - smooth_factor: Smooth factors (bf16/fp16)
+        - smooth_factor_orig: Original smooth factors (bf16/fp16)
+        - proj_down: Low-rank down projection (bf16/fp16)
+        - proj_up: Low-rank up projection (bf16/fp16)
     """
     if weight.ndim > 2:
         assert weight.numel() == weight.shape[0] * weight.shape[1]
@@ -72,11 +84,22 @@ def convert_to_nunchaku_sam2_linear_state_dict(
     if subscale is not None:
         state_dict[subscale_key] = subscale
     state_dict["bias"] = bias
-    state_dict["smooth_orig"] = smooth
-    state_dict["smooth"] = torch.ones_like(smooth) if smooth_fused else smooth.clone()
+    # Use SVDQW4A4Linear-compatible naming
+    state_dict["smooth_factor_orig"] = smooth
+    state_dict["smooth_factor"] = torch.ones_like(smooth) if smooth_fused else smooth.clone()
+
+    # Handle low-rank projections (proj_down/proj_up)
+    # SVDQW4A4Linear expects these even if SVDQuant wasn't used
     if lora is not None:
-        state_dict["lora_down"] = lora[0]
-        state_dict["lora_up"] = lora[1]
+        state_dict["proj_down"] = lora[0]
+        state_dict["proj_up"] = lora[1]
+    else:
+        # Create default empty low-rank projections for compatibility
+        # These will be zero tensors that don't affect the output
+        oc = weight.shape[0]  # output channels
+        ic = smooth.shape[0] if smooth.numel() > 1 else weight.shape[1] * 2  # input channels (weight is packed)
+        state_dict["proj_down"] = torch.zeros((ic, default_lora_rank), dtype=bias.dtype, device="cpu")
+        state_dict["proj_up"] = torch.zeros((oc, default_lora_rank), dtype=bias.dtype, device="cpu")
 
     return state_dict
 
@@ -147,10 +170,34 @@ def convert_to_nunchaku_sam2_block_state_dict(
 
         weight = candidates[weight_name]
         bias = candidates.get(bias_name, None)
+        # Try new format first ({weight_name}.scale.0), then fall back to old format ({weight_name})
         scale = scale_dict.get(f"{weight_name}.scale.0", None)
+        if scale is None:
+            # Try old format where scale is stored directly under weight_name
+            scale = scale_dict.get(weight_name, None)
+            if scale is not None:
+                # Reshape scale to expected 4D format [oc, 1, num_groups, 1]
+                oc = weight.shape[0]
+                if scale.ndim == 1:
+                    scale = scale.view(oc, 1, 1, 1)
+                elif scale.ndim == 2:
+                    scale = scale.view(oc, 1, scale.shape[1], 1)
         subscale = scale_dict.get(f"{weight_name}.scale.1", None)
-        smooth = smooth_dict.get(f"{block_name}.{smooth_name_map.get(converted_local_name, '')}", None)
-        branch = branch_dict.get(f"{block_name}.{branch_name_map.get(converted_local_name, '')}", None)
+        # Try different smooth key formats: {module_name}.smooth or {module_name}
+        smooth_key_base = f"{block_name}.{smooth_name_map.get(converted_local_name, '')}"
+        smooth = smooth_dict.get(f"{smooth_key_base}.smooth", None)
+        if smooth is None:
+            smooth = smooth_dict.get(smooth_key_base, None)
+        # Also try the weight name format
+        if smooth is None:
+            smooth = smooth_dict.get(f"{weight_name}.smooth", None)
+        if smooth is None:
+            smooth = smooth_dict.get(candidate_name, None)
+        # Try different branch key formats
+        branch_key_base = f"{block_name}.{branch_name_map.get(converted_local_name, '')}"
+        branch = branch_dict.get(branch_key_base, None)
+        if branch is None:
+            branch = branch_dict.get(candidate_name, None)
 
         if branch is not None:
             branch = (branch["a.weight"], branch["b.weight"])
