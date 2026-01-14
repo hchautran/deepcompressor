@@ -1,0 +1,4 @@
+# SAM2.1 Hiera Large model configuration (recommended)
+pipeline:
+  name: sam2.1-hiera-large
+  # checkpoint: ""  # Optional: local checkpoint path

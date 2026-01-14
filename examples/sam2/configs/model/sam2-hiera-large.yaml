@@ -1,0 +1,4 @@
+# SAM2 Hiera Large model configuration
+pipeline:
+  name: sam2-hiera-large
+  # checkpoint: ""  # Optional: local checkpoint path, otherwise downloads from HuggingFace

@@ -1,0 +1,4 @@
+# SAM2.1 Hiera Base+ model configuration
+pipeline:
+  name: sam2.1-hiera-base-plus
+  # checkpoint: ""  # Optional: local checkpoint path

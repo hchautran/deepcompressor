@@ -1,0 +1,28 @@
+# SVDQuant W4A8 configuration for SAM2
+# 4-bit weights + 8-bit activations (higher accuracy)
+quant:
+  wgts:
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    enable_low_rank: true
+    low_rank:
+      rank: 32
+      compensate: true
+      early_stop: true
+      num_iters: 100
+
+  ipts:
+    static: false
+    dtype: sint8
+    group_shapes:
+      - - 1
+        - -1
+        - -1  # Per-channel for 8-bit
+    scale_dtypes:
+      - null
+    allow_unsigned: true

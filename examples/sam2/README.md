@@ -1,313 +1,127 @@
-# SAM2 Post-Training Quantization
+# SAM2 SVDQuant W4A4 Quantization Examples
 
-This example demonstrates how to quantize SAM2 (Segment Anything Model 2) using DeepCompressor with nunchaku backend support.
+This directory contains example configurations and scripts for quantizing SAM2 models using SVDQuant with W4A4 (4-bit weights, 4-bit activations).
 
-## Overview
+## Prerequisites
 
-SAM2 uses a Hiera (Hierarchical Vision Transformer) backbone for image encoding. This pipeline quantizes the image encoder to reduce model size and improve inference speed.
+1. **SAM2 Installation**: Install SAM2 from the official repository:
+   ```bash
+   pip install sam2
+   # or from source:
+   # git clone https://github.com/facebookresearch/sam2.git
+   # cd sam2 && pip install -e .
+   ```
 
-**Supported Models:**
-| Model | HuggingFace ID | Parameters |
-|-------|----------------|------------|
-| tiny | facebook/sam2.1-hiera-tiny | 38M |
-| small | facebook/sam2.1-hiera-small | 46M |
-| base-plus | facebook/sam2.1-hiera-base-plus | 80M |
-| large | facebook/sam2.1-hiera-large | 224M |
-
-**Quantization Configurations:**
-| Config | Weights | Activations | Use Case |
-|--------|---------|-------------|----------|
-| W4A4 | 4-bit | 4-bit | Maximum compression |
-| W4A8 | 4-bit | 8-bit | Balanced accuracy/size |
-| W8A8 | 8-bit | 8-bit | Higher accuracy |
-
-## Requirements
-
-```bash
-pip install deepcompressor
-pip install transformers safetensors
-```
-
-For nunchaku backend support:
-```bash
-pip install nunchaku
-```
+2. **Calibration Dataset**: Download COCO val2017 images for calibration:
+   ```bash
+   # Download COCO val2017
+   wget http://images.cocodataset.org/zips/val2017.zip
+   unzip val2017.zip -d /path/to/coco/
+   ```
 
 ## Quick Start
 
-### Using a Configuration File
+### Using Python Script
 
 ```bash
-python quantize_sam2.py --config configs/hiera_tiny_w4a8.yaml
+# Quantize SAM2.1 Hiera Large (recommended)
+python scripts/quantize_sam2.py \
+    --model sam2.1-hiera-large \
+    --calib_path /path/to/coco/val2017
+
+# Quantize with custom settings
+python scripts/quantize_sam2.py \
+    --model sam2-hiera-base-plus \
+    --rank 64 \
+    --num_samples 256 \
+    --output_dir ./outputs
 ```
 
-### With Command-Line Arguments
+### Using Shell Script
 
 ```bash
-python quantize_sam2.py \
-    --model.name tiny \
-    --quant.calib.path /path/to/coco/val2017 \
-    --output.root ./outputs/sam2
+# Make script executable
+chmod +x scripts/run_quantize.sh
+
+# Run with defaults
+./scripts/run_quantize.sh sam2.1-hiera-large w4a4
+
+# Run with custom paths
+./scripts/run_quantize.sh sam2.1-hiera-large w4a4 /path/to/coco/val2017 /path/to/output
 ```
 
-### Convert to Nunchaku Format
+### Using YAML Configs
 
 ```bash
-python quantize_sam2.py \
-    --config configs/hiera_tiny_w4a8.yaml \
-    --convert-nunchaku
+# Run with YAML configuration
+python -m deepcompressor.app.sam2.ptq \
+    --config configs/__default__.yaml \
+    --config configs/model/sam2.1-hiera-large.yaml \
+    --config configs/svdquant/__default__.yaml \
+    --config configs/svdquant/w4a4.yaml \
+    --quant.calib.path /path/to/coco/val2017
 ```
 
 ## Configuration Files
 
-### Basic W4A8 Configuration
+### Model Variants
 
-```yaml
-# configs/hiera_tiny_w4a8.yaml
-model:
-  name: tiny
-  device: cuda
-  dtype: float16
+| File | Model | Description |
+|------|-------|-------------|
+| `configs/model/sam2.1-hiera-large.yaml` | SAM2.1 Hiera Large | Recommended, best accuracy |
+| `configs/model/sam2.1-hiera-base-plus.yaml` | SAM2.1 Hiera Base+ | Good balance |
+| `configs/model/sam2.1-hiera-small.yaml` | SAM2.1 Hiera Small | Faster inference |
+| `configs/model/sam2.1-hiera-tiny.yaml` | SAM2.1 Hiera Tiny | Fastest, lowest accuracy |
+| `configs/model/sam2-hiera-*.yaml` | SAM2 variants | Original SAM2 models |
 
-cache:
-  root: ./cache/sam2
+### Quantization Configs
 
-quant:
-  calib:
-    path: /path/to/coco/val2017
-    num_samples: 128
-    batch_size: 1
-    image_size: 1024
+| File | Description |
+|------|-------------|
+| `configs/svdquant/w4a4.yaml` | Standard W4A4 with SVDQuant (rank=32) |
+| `configs/svdquant/w4a4-fast.yaml` | Fast W4A4 (fewer iterations) |
+| `configs/svdquant/w4a4-r64.yaml` | High quality W4A4 (rank=64) |
+| `configs/svdquant/w4a8.yaml` | W4A8 for higher accuracy |
 
-  wgts:
-    dtype: uint4
-    group_shapes: [[1, 128]]
-    kernel_gptq:
-      damp_percentage: 0.01
-      block_size: 128
+## SVDQuant Parameters
 
-  ipts:
-    dtype: uint8
-    group_shapes: [[1, -1]]
-    static: false
-
-  smooth:
-    proj:
-      granularity: Layer
-      strategy: GridSearch
-      num_grids: 20
-      alpha: 0.5
-
-output:
-  root: ./outputs/sam2
-  job: hiera_tiny_w4a8
-
-save_model: true
-seed: 42
-```
-
-### Advanced: W4A8 with SVDQuant
-
-For better accuracy with 4-bit weights, enable SVDQuant low-rank compensation:
-
-```yaml
-# configs/hiera_large_w4a8_svdquant.yaml
-quant:
-  wgts:
-    dtype: uint4
-    group_shapes: [[1, 128]]
-    kernel_gptq:
-      damp_percentage: 0.01
-      block_size: 128
-      num_inv_tries: 250
-    low_rank:
-      rank: 32
-      exclusive: false
-
-  rotation:
-    transforms: [hadamard]
-    random: false
-```
-
-## Command-Line Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--config` | Path to YAML configuration file | None |
-| `--model.name` | Model variant (tiny, small, base-plus, large) | tiny |
-| `--model.device` | Device (cuda or cpu) | cuda |
-| `--quant.calib.path` | Path to calibration images | "" |
-| `--quant.calib.num_samples` | Number of calibration samples | 128 |
-| `--output.root` | Output directory | ./outputs/sam2 |
-| `--save-model` | Save the quantized model | false |
-| `--convert-nunchaku` | Convert to nunchaku format | false |
-| `--seed` | Random seed | 42 |
-| `--verbose`, `-v` | Enable verbose logging | false |
-
-## Calibration Dataset
-
-The quantization process requires a calibration dataset. You can use:
-
-1. **COCO val2017**: Download from [COCO dataset](https://cocodataset.org/)
-2. **SA-1B subset**: Download from [Segment Anything](https://segment-anything.com/)
-3. **Custom images**: Any directory containing JPEG/PNG images
-
-```bash
-# Example with COCO val2017
-python quantize_sam2.py \
-    --config configs/hiera_tiny_w4a8.yaml \
-    --quant.calib.path /data/coco/val2017
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `rank` | 32 | Low-rank dimension. Higher = better accuracy, more memory |
+| `num_iters` | 100 | Calibration iterations. More = better but slower |
+| `group_size` | 128 | Quantization group size |
+| `num_samples` | 128 | Number of calibration images |
 
 ## Output Structure
 
-After quantization, the output directory contains:
-
 ```
-outputs/sam2/hiera_tiny_w4a8/
+runs/sam2/
 ├── cache/
-│   ├── model.pt          # Quantized weights
-│   ├── scale.pt          # Quantization scales
-│   ├── smooth.pt         # Smooth quantization scales (if enabled)
-│   └── branch.pt         # SVDQuant branches (if enabled)
-├── nunchaku/             # (if --convert-nunchaku)
-│   ├── hiera_blocks.safetensors
-│   └── unquantized_layers.safetensors
-└── config.yaml           # Run configuration
+│   └── quant/
+│       ├── smooth.pt    # Smooth quantization scales
+│       ├── branch.pt    # SVDQuant low-rank branches
+│       ├── wgts.pt      # Weight quantizer state
+│       └── acts.pt      # Activation quantizer state
+└── sam2.1-hiera-large/
+    └── svdquant_w4a4_r32/
+        └── model.pt     # Quantized model checkpoint
 ```
 
-## Quantization Techniques
+## Tips
 
-### Smooth Quantization
+1. **Start with fewer samples**: Use `--num_samples 64` for quick testing before full calibration.
 
-Reduces activation outliers by migrating quantization difficulty from activations to weights:
+2. **Adjust rank for quality**: Increase `--rank 64` for better accuracy at the cost of memory.
 
-```yaml
-quant:
-  smooth:
-    proj:
-      granularity: Layer
-      strategy: GridSearch
-      num_grids: 20
-      alpha: 0.5  # Balance between activation and weight quantization
+3. **Fast mode**: Use `w4a4-fast.yaml` config for rapid prototyping.
+
+4. **Memory issues**: Reduce batch size with `--batch_size 1` if running out of GPU memory.
+
+## Calibration Path
+
+The default calibration path is set to:
+```
+/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017
 ```
 
-### Rotation (Hadamard Transform)
-
-Applies Hadamard rotation to improve weight distribution:
-
-```yaml
-quant:
-  rotation:
-    transforms: [hadamard]
-    random: false
-```
-
-### SVDQuant (Low-Rank Compensation)
-
-Adds low-rank branches to compensate for quantization error:
-
-```yaml
-quant:
-  wgts:
-    low_rank:
-      rank: 32        # Rank of compensation matrices
-      exclusive: false
-```
-
-## Validating Quantized Models
-
-After quantization, validate the model quality by comparing outputs with the original model.
-
-### Quick Validation
-
-```bash
-python validate_sam2.py \
-    --original facebook/sam2.1-hiera-tiny \
-    --quantized ./outputs/sam2/hiera_tiny_w4a8/model \
-    --images /path/to/validation/images \
-    --num-samples 32
-```
-
-### Full Validation with Layer Comparison
-
-```bash
-python validate_sam2.py \
-    --original facebook/sam2.1-hiera-tiny \
-    --quantized ./outputs/sam2/hiera_tiny_w4a8/model \
-    --images /path/to/coco/val2017 \
-    --num-samples 100 \
-    --compare-layers \
-    --save-report validation_report.json
-```
-
-### Validation Metrics
-
-| Metric | Description | Target |
-|--------|-------------|--------|
-| Cosine Similarity | Similarity between original and quantized outputs | >= 0.95 |
-| SNR (dB) | Signal-to-Noise Ratio | >= 20 dB |
-| MSE | Mean Squared Error | Lower is better |
-| MAE | Mean Absolute Error | Lower is better |
-
-### Quality Interpretation
-
-| Cosine Similarity | Quality | Recommendation |
-|-------------------|---------|----------------|
-| >= 0.99 | Excellent | Ready for production |
-| 0.95 - 0.99 | Good | Suitable for most use cases |
-| 0.90 - 0.95 | Acceptable | May need fine-tuning for sensitive tasks |
-| 0.80 - 0.90 | Fair | Consider less aggressive quantization |
-| < 0.80 | Poor | Increase calibration samples or reduce quantization |
-
-### Programmatic Validation
-
-```python
-from deepcompressor.app.sam2 import validate_quantization
-from deepcompressor.app.sam2.dataset.calib import Sam2CalibConfig
-
-# Build dataloader
-calib_config = Sam2CalibConfig(
-    path="/path/to/images",
-    num_samples=32,
-)
-dataloader = calib_config.build_dataloader()
-
-# Validate
-result = validate_quantization(
-    original_model=original_model,
-    quantized_model=quantized_model,
-    dataloader=dataloader,
-    compare_intermediate=True,
-)
-
-print(f"Cosine Similarity: {result.cosine_similarity:.4f}")
-print(f"SNR: {result.snr_db:.2f} dB")
-```
-
-## Tips for Best Results
-
-1. **Use more calibration samples** for larger models (256+ for large)
-2. **Enable smooth quantization** for W4A8 configurations
-3. **Use SVDQuant** for W4A4 to maintain accuracy
-4. **Enable rotation** when using aggressive quantization (W4A4)
-5. **Validate after quantization** to ensure quality meets requirements
-
-## Troubleshooting
-
-### CUDA Out of Memory
-
-- Reduce `batch_size` in calibration config
-- Use a smaller model variant
-- Run on CPU with `--model.device cpu` (slower)
-
-### Poor Accuracy
-
-- Increase `num_samples` for calibration
-- Enable smooth quantization
-- Try SVDQuant with higher rank
-- Use W4A8 instead of W4A4
-
-## License
-
-This example follows the same license as DeepCompressor.
+Override with `--quant.calib.path` or `--calib_path` as needed.

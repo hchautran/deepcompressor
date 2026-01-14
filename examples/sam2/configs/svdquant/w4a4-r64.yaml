@@ -1,0 +1,28 @@
+# SVDQuant W4A4 with higher rank (r=64) for SAM2
+# Higher rank means better accuracy but more memory
+quant:
+  wgts:
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    enable_low_rank: true
+    low_rank:
+      rank: 64  # Higher rank for better accuracy
+      compensate: true
+      early_stop: true
+      num_iters: 100
+
+  ipts:
+    static: false
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    allow_unsigned: true

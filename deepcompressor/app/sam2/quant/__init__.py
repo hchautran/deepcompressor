@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-"""SAM2 quantization modules."""
+"""SAM2 quantization modules for SVDQuant W4A4."""
 
-from .activation import quantize_sam2_activations
-from .config import Sam2QuantConfig
-from .rotate import rotate_sam2
-from .smooth import smooth_sam2
-from .weight import load_sam2_weights_state_dict, quantize_sam2_weights
+from .config import SAM2QuantConfig
+from .quantizer import (
+    SAM2QuantizerConfig,
+    SAM2WeightQuantizerConfig,
+    SAM2ActivationQuantizerConfig,
+    SAM2ModuleQuantizerConfig,
+)
 
 __all__ = [
-    "Sam2QuantConfig",
-    "quantize_sam2_weights",
-    "quantize_sam2_activations",
-    "smooth_sam2",
-    "rotate_sam2",
-    "load_sam2_weights_state_dict",
+    "SAM2QuantConfig",
+    "SAM2QuantizerConfig",
+    "SAM2WeightQuantizerConfig",
+    "SAM2ActivationQuantizerConfig",
+    "SAM2ModuleQuantizerConfig",
 ]

@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-"""SAM2 quantizer classes."""
+"""SAM2 quantizer configurations."""
 
 from .config import (
-    Sam2ActivationQuantizerConfig,
-    Sam2ModuleQuantizerConfig,
-    Sam2WeightQuantizerConfig,
+    SAM2QuantizerConfig,
+    SAM2WeightQuantizerConfig,
+    SAM2ActivationQuantizerConfig,
+    SAM2ModuleQuantizerConfig,
 )
-from .quantizer import Sam2ActivationQuantizer, Sam2WeightQuantizer
 
 __all__ = [
-    "Sam2ModuleQuantizerConfig",
-    "Sam2WeightQuantizerConfig",
-    "Sam2ActivationQuantizerConfig",
-    "Sam2WeightQuantizer",
-    "Sam2ActivationQuantizer",
+    "SAM2QuantizerConfig",
+    "SAM2WeightQuantizerConfig",
+    "SAM2ActivationQuantizerConfig",
+    "SAM2ModuleQuantizerConfig",
 ]

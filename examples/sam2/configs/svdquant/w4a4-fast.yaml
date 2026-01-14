@@ -1,0 +1,30 @@
+# Fast SVDQuant W4A4 configuration for SAM2
+# Faster calibration with fewer iterations
+quant:
+  wgts:
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    enable_low_rank: true
+    low_rank:
+      rank: 32
+      compensate: true
+      early_stop: true
+      num_iters: 10  # Fewer iterations for faster calibration
+
+  ipts:
+    static: false
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    allow_unsigned: true
+
+  enable_smooth: false  # Disable smooth quant for speed

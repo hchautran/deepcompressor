@@ -1,0 +1,4 @@
+# SAM2.1 Hiera Small model configuration
+pipeline:
+  name: sam2.1-hiera-small
+  # checkpoint: ""  # Optional: local checkpoint path

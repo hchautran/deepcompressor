@@ -1,0 +1,121 @@
+# Default configuration for SAM2 SVDQuant W4A4 quantization
+seed: 12345
+enable_cache: true
+
+cache:
+  root: runs/sam2
+
+output:
+  root: runs/sam2
+  dirname: default
+
+pipeline:
+  dtype: torch.float16
+  device: cuda
+
+quant:
+  calib:
+    data: COCO
+    # Default path - override with your COCO val2017 path
+    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017
+    num_samples: 128
+    batch_size: 1
+    num_workers: 4
+    image_size: 1024
+
+  # Weight quantization config (4-bit)
+  wgts:
+    dtype: null  # Override with sint4 for W4
+    zero_point: null
+    group_shapes:
+      - - 1
+        - -1
+        - 128  # Per-group with group size 128
+    scale_dtypes:
+      - null
+    skips: []
+    enable_calib_range: true
+    calib_range:
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      granularity: Layer
+      element_batch_size: 64
+      sample_batch_size: 64
+      element_size: 512
+      sample_size: -1
+      ratio: 1.0
+      max_shrink: 0.2
+      max_expand: 1.0
+      num_grids: 80
+      skips: []
+    # SVDQuant low-rank configuration
+    low_rank:
+      rank: 32
+      exclusive: false
+      compensate: true
+      early_stop: true
+      degree: 2
+      objective: OutputsError
+      sample_batch_size: 64
+      sample_size: -1
+      num_iters: 1
+      skips: []
+
+  # Input activation quantization config (4-bit)
+  ipts:
+    static: false  # Dynamic quantization for activations
+    dtype: null  # Override with sint4 for A4
+    zero_point: null
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    allow_unsigned: true
+    skips: []
+    enable_calib_range: false
+    calib_range:
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      granularity: Layer
+      element_batch_size: 64
+      sample_batch_size: 64
+      element_size: 512
+      sample_size: -1
+      ratio: 1.0
+      max_shrink: 0.2
+      max_expand: 1.0
+      num_grids: 80
+      skips: []
+
+  # Output activation quantization (disabled)
+  opts:
+    dtype: null
+
+  # Smooth quantization (optional)
+  enable_smooth: false
+  smooth:
+    enable_proj: false
+    proj:
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      granularity: Layer
+      element_batch_size: -1
+      sample_batch_size: 64
+      element_size: -1
+      sample_size: -1
+      pre_reshape: true
+      outputs_device: cpu
+      spans:
+        - - AbsMax
+          - AbsMax
+      alpha: 0.5
+      beta: -1
+      num_grids: 20
+      skips: []
+
+  develop_dtype: torch.float32

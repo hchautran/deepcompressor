@@ -1,0 +1,28 @@
+# SVDQuant W4A4 configuration for SAM2
+# 4-bit weights + 4-bit activations with SVD low-rank compensation
+quant:
+  wgts:
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128  # Per-group quantization with group size 128
+    scale_dtypes:
+      - null
+    enable_low_rank: true
+    low_rank:
+      rank: 32
+      compensate: true
+      early_stop: true
+      num_iters: 100
+
+  ipts:
+    static: false  # Dynamic activation quantization
+    dtype: sint4
+    group_shapes:
+      - - 1
+        - -1
+        - 128
+    scale_dtypes:
+      - null
+    allow_unsigned: true
