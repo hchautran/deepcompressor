@@ -1,0 +1,124 @@
+output:
+  root: ./outputs/sam2
+  dirname: large
+  job: hiera_large_w4a4_svdquant
+model:
+  name: large
+  device: cuda
+  dtype: torch.float16
+  hf_id: ''
+  config: ''
+  ckpt_path: ''
+  image_size: 1024
+quant:
+  wgts:
+    dtype: uint4
+    zero_point: null
+    group_shapes:
+    - - 1
+      - 128
+      - -1
+    scale_dtypes:
+    - null
+    kernel_gptq:
+      damp_percentage: 0.01
+      block_size: 128
+      num_inv_tries: 250
+      hessian_block_size: -1
+      skips: []
+    low_rank:
+      rank: 32
+      exclusive: false
+      compensate: false
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      sample_batch_size: -1
+      sample_size: -1
+      outputs_device: cpu
+      num_iters: 1
+      early_stop: false
+      skips: []
+    calib_range:
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      granularity: Layer
+      element_batch_size: -1
+      sample_batch_size: -1
+      element_size: -1
+      sample_size: -1
+      pre_reshape: true
+      outputs_device: cpu
+      ratio: 1.0
+      max_shrink: 0.2
+      max_expand: 1.0
+      num_grids: 80
+      allow_scale: false
+      skips: []
+    skips: []
+  ipts:
+    dtype: uint4
+    zero_point: null
+    group_shapes:
+    - - 1
+      - -1
+      - -1
+    scale_dtypes:
+    - null
+    static: false
+    calib_range:
+      degree: 2
+      objective: OutputsError
+      strategy: Manual
+      granularity: Layer
+      element_batch_size: -1
+      sample_batch_size: -1
+      element_size: -1
+      sample_size: -1
+      pre_reshape: true
+      outputs_device: cpu
+      ratio: 1.0
+      max_shrink: 0.2
+      max_expand: 1.0
+      num_grids: 80
+      allow_scale: false
+      skips: []
+    skips: []
+    allow_unsigned: false
+  opts:
+    dtype: null
+    zero_point: null
+    group_shapes:
+    - - -1
+      - -1
+      - -1
+    scale_dtypes:
+    - null
+    static: false
+    calib_range: null
+    skips: []
+    allow_unsigned: false
+  extra_wgts: null
+  calib:
+    data: coco
+    num_samples: 256
+    batch_size: 1
+    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017
+    image_size: 1024
+    num_workers: 8
+    seed: 42
+  rotation:
+    name: hadamard
+    path: ''
+    random: false
+    transforms:
+    - hadamard
+  smooth: null
+  develop_dtype: torch.float32
+cache:
+  root: ./cache/sam2
+seed: 42
+load_from: ''
+save_model: true
+copy_on_save: false

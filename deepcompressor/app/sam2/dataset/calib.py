@@ -1,153 +1,171 @@
 # -*- coding: utf-8 -*-
-"""SAM2 calibration dataset."""
+"""Calibration dataset for SAM2 Hiera."""
 
 import os
 import random
 import typing as tp
-from dataclasses import dataclass, field
-from transformer
+from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
+import torch.utils.data
 from omniconfig import configclass
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
 
-__all__ = ["Sam2CalibConfig", "Sam2CalibDataset"]
+from deepcompressor.data.cache import IOTensorsCache, ModuleForwardInput
+from deepcompressor.dataset.action import CacheAction, ConcatCacheAction
+from deepcompressor.dataset.cache import BaseCalibCacheLoader
+from deepcompressor.dataset.config import BaseDataLoaderConfig
+
+from ..nn.struct import Sam2BlockStruct, Sam2ModelStruct
+
+try:  # Optional import for runtime.
+    from sam2.utils.transforms import SAM2Transforms
+except Exception:  # pragma: no cover
+    SAM2Transforms = None
+
+__all__ = [
+    "Sam2CalibCacheLoaderConfig",
+    "Sam2CalibDataset",
+    "Sam2CalibCacheLoader",
+]
 
 
 @configclass
-@dataclass
-class Sam2CalibConfig:
-    """SAM2 calibration dataset configuration.
+@dataclass(kw_only=True)
+class Sam2CalibCacheLoaderConfig(BaseDataLoaderConfig):
+    """Configuration for SAM2 calibration dataset.
 
     Args:
-        path (`str`):
-            The path to the calibration dataset (directory of images).
-        num_samples (`int`, *optional*, defaults to `128`):
-            The number of samples to use for calibration.
-        batch_size (`int`, *optional*, defaults to `1`):
-            The batch size for calibration.
-        image_size (`int`, *optional*, defaults to `1024`):
-            The image size for SAM2 input.
-        seed (`int`, *optional*, defaults to `42`):
-            The random seed for sampling.
+        data (`str`): Dataset name.
+        num_samples (`int`): Number of samples.
+        batch_size (`int`): Batch size.
+        path (`str`): Path to image directory.
+        image_size (`int`): Resize resolution for SAM2.
+        num_workers (`int`): DataLoader workers.
+        seed (`int`): Shuffle seed.
     """
 
-    path: str = ""
-    num_samples: int = 128
-    batch_size: int = 1
+    data: str = "coco"
+    path: str
     image_size: int = 1024
+    num_workers: int = 8
     seed: int = 42
 
-    def generate_dirnames(self) -> list[str]:
-        """Generate directory names for caching."""
-        names = []
-        if self.path:
-            dataset_name = os.path.basename(self.path.rstrip("/"))
-            names.append(f"data.{dataset_name}")
-        names.append(f"n{self.num_samples}")
-        return names
+    def __post_init__(self) -> None:
+        self.path = os.path.abspath(os.path.expanduser(self.path)) if self.path else ""
 
-    def build_dataloader(self) -> DataLoader:
-        """Build a dataloader for calibration."""
-        dataset = Sam2CalibDataset(self)
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
+    def build_dataset(self) -> "Sam2CalibDataset":
+        return Sam2CalibDataset(
+            self.path,
+            num_samples=self.num_samples,
+            seed=self.seed,
+            image_size=self.image_size,
         )
 
+    def build_loader(self) -> "Sam2CalibCacheLoader":
+        return Sam2CalibCacheLoader(self)
 
-class Sam2CalibDataset(Dataset):
-    """SAM2 calibration dataset.
 
-    Loads images from a directory for calibration purposes.
-    """
+class Sam2CalibDataset(torch.utils.data.Dataset):
+    """Simple image folder dataset for SAM2 calibration."""
 
-    SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-    def __init__(self, config: Sam2CalibConfig):
-        """Initialize the calibration dataset.
-
-        Args:
-            config: Calibration configuration.
-        """
-        self.config = config
-        self.image_size = config.image_size
-
-        # Collect image paths
-        self.image_paths = self._collect_images(config.path)
-
-        # Sample images
-        random.seed(config.seed)
-        if len(self.image_paths) > config.num_samples:
-            self.image_paths = random.sample(self.image_paths, config.num_samples)
-        elif len(self.image_paths) < config.num_samples:
-            # If not enough images, repeat
-            self.image_paths = self.image_paths * (config.num_samples // len(self.image_paths) + 1)
-            self.image_paths = self.image_paths[: config.num_samples]
-
-        self._processor = None
-
-    def _collect_images(self, path: str) -> list[str]:
-        """Collect image paths from directory."""
-        if not path or not os.path.exists(path):
-            return []
-
-        image_paths = []
-        for root, dirs, files in os.walk(path):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in self.SUPPORTED_EXTENSIONS:
-                    image_paths.append(os.path.join(root, file))
-
-        return sorted(image_paths)
-
-    @property
-    def processor(self):
-        """Lazy load the SAM2 processor."""
-        if self._processor is None:
-            try:
-                from transformers import Sam2Processor
-
-                self._processor = Sam2Processor.from_pretrained("facebook/sam2.1-hiera-tiny")
-            except Exception:
-                self._processor = None
-        return self._processor
+    def __init__(self, path: str, num_samples: int, seed: int, image_size: int) -> None:
+        if not path or not os.path.isdir(path):
+            raise ValueError(f"Invalid calibration path: {path}")
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+        filenames = [f for f in sorted(os.listdir(path)) if f.lower().endswith(exts)]
+        if num_samples > 0 and num_samples < len(filenames):
+            random.Random(seed).shuffle(filenames)
+            filenames = sorted(filenames[:num_samples])
+        if not filenames:
+            raise ValueError(f"No images found under: {path}")
+        self.filepaths = [os.path.join(path, name) for name in filenames]
+        if SAM2Transforms is None:
+            raise RuntimeError("SAM2Transforms not available; ensure sam2 is installed")
+        self.transforms = SAM2Transforms(resolution=image_size, mask_threshold=0.0)
 
     def __len__(self) -> int:
-        return len(self.image_paths)
+        return len(self.filepaths)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Get a calibration sample.
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        with Image.open(self.filepaths[idx]) as img:
+            image = img.convert("RGB")
+        return self.transforms(image).to(dtype=torch.float16)
 
-        Returns:
-            Dictionary with 'pixel_values' tensor.
-        """
-        image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert("RGB")
+    def build_loader(self, **kwargs) -> torch.utils.data.DataLoader:
+        return torch.utils.data.DataLoader(self, **kwargs)
 
-        if self.processor is not None:
-            inputs = self.processor(images=image, return_tensors="pt")
-            return {"pixel_values": inputs["pixel_values"].squeeze(0)}
+
+class Sam2CalibCacheLoader(BaseCalibCacheLoader):
+    config: Sam2CalibCacheLoaderConfig
+    dataset: Sam2CalibDataset
+
+    def __init__(self, config: Sam2CalibCacheLoaderConfig) -> None:
+        super().__init__(dataset=config.build_dataset(), batch_size=config.batch_size)
+        self.batch_size = min(config.batch_size, len(self.dataset))
+        self.config = config
+
+    def iter_samples(self) -> tp.Generator[ModuleForwardInput, None, None]:
+        dataloader = self.dataset.build_loader(
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=True,
+            num_workers=self.config.num_workers,
+        )
+        for batch in dataloader:
+            yield ModuleForwardInput(args=[batch], kwargs={})
+
+    def iter_layer_activations(  # noqa: C901
+        self,
+        model: nn.Module | Sam2ModelStruct,
+        *args,
+        needs_inputs_fn: tp.Callable[[str, nn.Module], bool],
+        needs_outputs_fn: tp.Callable[[str, nn.Module], bool] | None = None,
+        action: CacheAction | None = None,
+        skip_pre_modules: bool = False,
+        skip_post_modules: bool = False,
+        **kwargs,
+    ) -> tp.Generator[
+        tuple[
+            str,
+            tuple[
+                Sam2BlockStruct | nn.Module,
+                dict[str, IOTensorsCache],
+                dict[str, tp.Any],
+            ],
+        ],
+        None,
+        None,
+    ]:
+        if not isinstance(model, Sam2ModelStruct):
+            model_struct = Sam2ModelStruct.construct(model)
         else:
-            # Fallback: simple resize and normalize
-            from torchvision import transforms
-
-            transform = transforms.Compose(
-                [
-                    transforms.Resize((self.image_size, self.image_size)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ]
+            model_struct = model
+            model = model_struct.module
+        assert isinstance(model_struct, Sam2ModelStruct)
+        assert isinstance(model, nn.Module)
+        layers, layer_structs, recomputes, use_prev_layer_outputs = model_struct.get_iter_layer_activations_args(
+            skip_pre_modules=skip_pre_modules,
+            skip_post_modules=skip_post_modules,
+        )
+        action = ConcatCacheAction("cpu") if action is None else action
+        for layer_idx, (layer_name, (layer, layer_cache, layer_inputs)) in enumerate(
+            self._iter_layer_activations(
+                model,
+                *args,
+                action=action,
+                layers=layers,
+                needs_inputs_fn=needs_inputs_fn,
+                needs_outputs_fn=needs_outputs_fn,
+                recomputes=recomputes,
+                use_prev_layer_outputs=use_prev_layer_outputs,
+                **kwargs,
             )
-            pixel_values = transform(image)
-            return {"pixel_values": pixel_values}
-
-
-def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Collate function for DataLoader."""
-    pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    return {"pixel_values": pixel_values}
+        ):
+            layer_kwargs = {k: v for k, v in layer_inputs[0].kwargs.items()}  # noqa: C416
+            layer_struct = layer_structs[layer_idx]
+            if isinstance(layer_struct, Sam2BlockStruct):
+                assert layer_struct.name == layer_name
+                assert layer is layer_struct.module
+            yield layer_name, (layer_struct, layer_cache, layer_kwargs)

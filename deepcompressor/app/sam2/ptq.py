@@ -1,15 +1,14 @@
-# -*- coding: utf-8 -*-
-"""SAM2 post-training quantization."""
-
 import gc
+import json
 import os
+import pprint
+import traceback
 
 import torch
-from torch.utils.data import DataLoader
 
 from deepcompressor.utils import tools
 
-from .cache.config import Sam2PtqCacheConfig, Sam2QuantCacheConfig
+from .config import Sam2PtqCacheConfig, Sam2PtqRunConfig, Sam2QuantCacheConfig, Sam2QuantConfig
 from .nn.struct import Sam2ModelStruct
 from .quant import (
     load_sam2_weights_state_dict,
@@ -18,48 +17,22 @@ from .quant import (
     rotate_sam2,
     smooth_sam2,
 )
-from .quant.config import Sam2QuantConfig
-from .quant.utils import ActivationStatsCollector, collect_activation_statistics
 
 __all__ = ["ptq"]
 
 
-def ptq(
+def ptq(  # noqa: C901
     model: Sam2ModelStruct,
     config: Sam2QuantConfig,
     cache: Sam2PtqCacheConfig | None = None,
-    calib_dataloader: DataLoader | None = None,
     load_dirpath: str = "",
     save_dirpath: str = "",
     copy_on_save: bool = False,
     save_model: bool = False,
+    full_model: torch.nn.Module | None = None,
 ) -> Sam2ModelStruct:
-    """Post-training quantization of a SAM2 model.
-
-    Args:
-        model (`Sam2ModelStruct`):
-            The SAM2 model structure.
-        config (`Sam2QuantConfig`):
-            The SAM2 model post-training quantization configuration.
-        cache (`Sam2PtqCacheConfig`, *optional*, defaults to `None`):
-            The SAM2 model quantization cache path configuration.
-        calib_dataloader (`DataLoader`, *optional*, defaults to `None`):
-            DataLoader for calibration data.
-        load_dirpath (`str`, *optional*, defaults to `""`):
-            The directory path to load the quantization checkpoint.
-        save_dirpath (`str`, *optional*, defaults to `""`):
-            The directory path to save the quantization checkpoint.
-        copy_on_save (`bool`, *optional*, defaults to `False`):
-            Whether to copy the cache to the save directory.
-        save_model (`bool`, *optional*, defaults to `False`):
-            Whether to save the quantized model checkpoint.
-
-    Returns:
-        `Sam2ModelStruct`:
-            The quantized SAM2 model.
-    """
+    """Post-training quantization of a SAM2 Hiera model."""
     logger = tools.logging.getLogger(__name__)
-
     if not isinstance(model, Sam2ModelStruct):
         model = Sam2ModelStruct.construct(model)
     assert isinstance(model, Sam2ModelStruct)
@@ -77,7 +50,6 @@ def ptq(
             branch=os.path.join(load_dirpath, "branch.pt"),
             wgts=os.path.join(load_dirpath, "wgts.pt"),
             acts=os.path.join(load_dirpath, "acts.pt"),
-            calib_stats=os.path.join(load_dirpath, "calib_stats.pt"),
         )
         load_model_path = os.path.join(load_dirpath, "model.pt")
         if os.path.exists(load_model_path):
@@ -91,13 +63,12 @@ def ptq(
                 load_model = True
             if load_model:
                 logger.info(f"* Loading model from {load_model_path}")
-                save_dirpath = ""
+                save_dirpath = ""  # do not save the model if loading
         else:
             logger.warning(f"Model checkpoint {load_model_path} does not exist")
             load_model = False
     else:
         load_model = False
-
     if save_dirpath:
         os.makedirs(save_dirpath, exist_ok=True)
         save_path = Sam2QuantCacheConfig(
@@ -105,64 +76,10 @@ def ptq(
             branch=os.path.join(save_dirpath, "branch.pt"),
             wgts=os.path.join(save_dirpath, "wgts.pt"),
             acts=os.path.join(save_dirpath, "acts.pt"),
-            calib_stats=os.path.join(save_dirpath, "calib_stats.pt"),
         )
     else:
         save_model = False
 
-    # Calibration phase - collect activation statistics
-    activation_stats: ActivationStatsCollector | None = None
-    needs_calib = (config.enabled_smooth or config.enabled_wgts) and not load_model
-
-    if needs_calib:
-        logger.info("* Collecting activation statistics for calibration")
-        tools.logging.Formatter.indent_inc()
-
-        # Try to load from cache
-        calib_stats_load_from = ""
-        if load_path and hasattr(load_path, 'calib_stats') and os.path.exists(load_path.calib_stats):
-            calib_stats_load_from = load_path.calib_stats
-        elif cache and cache.path.calib_stats and os.path.exists(cache.path.calib_stats):
-            calib_stats_load_from = cache.path.calib_stats
-
-        if calib_stats_load_from:
-            logger.info(f"- Loading calibration statistics from {calib_stats_load_from}")
-            calib_stats_dict = torch.load(calib_stats_load_from)
-            activation_stats = ActivationStatsCollector.from_state_dict(calib_stats_dict)
-        elif calib_dataloader is not None:
-            logger.info("- Running calibration inference")
-            device = next(model.module.parameters()).device
-            activation_stats = collect_activation_statistics(
-                model,
-                calib_dataloader,
-                device=device,
-                collect_input=True,
-                collect_output=True,
-            )
-            # Save to cache
-            if cache and cache.dirpath.calib_stats:
-                logger.info(f"- Saving calibration statistics to {cache.path.calib_stats}")
-                os.makedirs(cache.dirpath.calib_stats, exist_ok=True)
-                torch.save(activation_stats.to_state_dict(), cache.path.calib_stats)
-                calib_stats_load_from = cache.path.calib_stats
-        else:
-            logger.warning("- No calibration data provided, using weight-based approximation")
-
-        # Save to output if needed
-        if save_path and activation_stats is not None:
-            if not copy_on_save and calib_stats_load_from:
-                logger.info(f"- Linking calibration statistics to {save_path.calib_stats}")
-                if not os.path.exists(save_path.calib_stats):
-                    os.symlink(os.path.relpath(calib_stats_load_from, save_dirpath), save_path.calib_stats)
-            else:
-                logger.info(f"- Saving calibration statistics to {save_path.calib_stats}")
-                torch.save(activation_stats.to_state_dict(), save_path.calib_stats)
-
-        tools.logging.Formatter.indent_dec()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    # Rotation phase
     if quant and config.enabled_rotation:
         logger.info("* Rotating model for quantization")
         tools.logging.Formatter.indent_inc()
@@ -171,7 +88,7 @@ def ptq(
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Smooth quantization phase
+    # region smooth quantization
     if quant and config.enabled_smooth:
         logger.info("* Smoothing model for quantization")
         tools.logging.Formatter.indent_inc()
@@ -186,7 +103,7 @@ def ptq(
             smooth_sam2(model, config, smooth_cache=smooth_cache)
         else:
             logger.info("- Generating smooth scales")
-            smooth_cache = smooth_sam2(model, config, activation_stats=activation_stats)
+            smooth_cache = smooth_sam2(model, config)
             if cache and cache.path.smooth:
                 logger.info(f"- Saving smooth scales to {cache.path.smooth}")
                 os.makedirs(cache.dirpath.smooth, exist_ok=True)
@@ -195,8 +112,7 @@ def ptq(
         if save_path:
             if not copy_on_save and load_from:
                 logger.info(f"- Linking smooth scales to {save_path.smooth}")
-                if not os.path.exists(save_path.smooth):
-                    os.symlink(os.path.relpath(load_from, save_dirpath), save_path.smooth)
+                os.symlink(os.path.relpath(load_from, save_dirpath), save_path.smooth)
             else:
                 logger.info(f"- Saving smooth scales to {save_path.smooth}")
                 torch.save(smooth_cache, save_path.smooth)
@@ -204,8 +120,8 @@ def ptq(
         tools.logging.Formatter.indent_dec()
         gc.collect()
         torch.cuda.empty_cache()
-
-    # Collect original state dict for activation quantization
+    # endregion
+    # region collect original state dict
     if config.needs_acts_quantizer_cache:
         if load_path and os.path.exists(load_path.acts):
             orig_state_dict = None
@@ -217,8 +133,7 @@ def ptq(
             }
     else:
         orig_state_dict = None
-
-    # Load model if checkpoint exists
+    # endregion
     if load_model:
         logger.info(f"* Loading model checkpoint from {load_model_path}")
         load_sam2_weights_state_dict(
@@ -257,8 +172,6 @@ def ptq(
             config,
             quantizer_state_dict=quantizer_state_dict,
             branch_state_dict=branch_state_dict,
-            activation_stats=activation_stats,
-            calib_dataloader=calib_dataloader,
             return_with_scale_state_dict=bool(save_dirpath),
         )
         if not quantizer_load_from and cache and cache.dirpath.wgts:
@@ -274,30 +187,27 @@ def ptq(
         if save_path:
             if not copy_on_save and quantizer_load_from:
                 logger.info(f"- Linking weight settings to {save_path.wgts}")
-                if not os.path.exists(save_path.wgts):
-                    os.symlink(os.path.relpath(quantizer_load_from, save_dirpath), save_path.wgts)
+                os.symlink(os.path.relpath(quantizer_load_from, save_dirpath), save_path.wgts)
             else:
                 logger.info(f"- Saving weight settings to {save_path.wgts}")
                 torch.save(quantizer_state_dict, save_path.wgts)
             if not copy_on_save and branch_load_from:
                 logger.info(f"- Linking branch settings to {save_path.branch}")
-                if not os.path.exists(save_path.branch):
-                    os.symlink(os.path.relpath(branch_load_from, save_dirpath), save_path.branch)
+                os.symlink(os.path.relpath(branch_load_from, save_dirpath), save_path.branch)
             else:
                 logger.info(f"- Saving branch settings to {save_path.branch}")
                 torch.save(branch_state_dict, save_path.branch)
         if save_model:
             logger.info(f"- Saving model to {save_dirpath}")
             torch.save(scale_state_dict, os.path.join(save_dirpath, "scale.pt"))
-            torch.save(model.module.state_dict(), os.path.join(save_dirpath, "model.pt"))
+            state_dict = full_model.state_dict() if full_model is not None else model.module.state_dict()
+            torch.save(state_dict, os.path.join(save_dirpath, "model.pt"))
         del quantizer_state_dict, branch_state_dict, scale_state_dict
         tools.logging.Formatter.indent_dec()
         gc.collect()
         torch.cuda.empty_cache()
-
-    # Activation quantization phase
     if quant_acts:
-        logger.info("* Quantizing activations")
+        logger.info("  * Quantizing activations")
         tools.logging.Formatter.indent_inc()
         if config.needs_acts_quantizer_cache:
             load_from = ""
@@ -313,19 +223,16 @@ def ptq(
                 )
             else:
                 logger.info("- Generating activation settings")
-                quantizer_state_dict = quantize_sam2_activations(
-                    model, config, orig_state_dict=orig_state_dict, activation_stats=activation_stats
-                )
+                quantizer_state_dict = quantize_sam2_activations(model, config, orig_state_dict=orig_state_dict)
                 if cache and cache.dirpath.acts and quantizer_state_dict is not None:
                     logger.info(f"- Saving activation settings to {cache.path.acts}")
                     os.makedirs(cache.dirpath.acts, exist_ok=True)
                     torch.save(quantizer_state_dict, cache.path.acts)
-                load_from = cache.path.acts if cache else ""
-            if save_dirpath and save_path:
+                load_from = cache.path.acts
+            if save_dirpath:
                 if not copy_on_save and load_from:
                     logger.info(f"- Linking activation quantizer settings to {save_path.acts}")
-                    if not os.path.exists(save_path.acts):
-                        os.symlink(os.path.relpath(load_from, save_dirpath), save_path.acts)
+                    os.symlink(os.path.relpath(load_from, save_dirpath), save_path.acts)
                 else:
                     logger.info(f"- Saving activation quantizer settings to {save_path.acts}")
                     torch.save(quantizer_state_dict, save_path.acts)
@@ -337,5 +244,72 @@ def ptq(
         del orig_state_dict
         gc.collect()
         torch.cuda.empty_cache()
-
     return model
+
+
+def main(config: Sam2PtqRunConfig, logging_level: int = tools.logging.DEBUG) -> torch.nn.Module:
+    """Post-training quantization for SAM2."""
+    config.output.lock()
+    config.dump(path=config.output.get_running_job_path("config.yaml"))
+    tools.logging.setup(path=config.output.get_running_job_path("run.log"), level=logging_level)
+    logger = tools.logging.getLogger(__name__)
+
+    logger.info("=== Configurations ===")
+    tools.logging.info(config.formatted_str(), logger=logger)
+    logger.info("=== Dumped Configurations ===")
+    tools.logging.info(pprint.pformat(config.dump(), indent=2, width=120), logger=logger)
+    logger.info("=== Output Directory ===")
+    logger.info(config.output.job_dirpath)
+
+    logger.info("=== Start Quantization ===")
+    logger.info("* Building SAM2 model")
+    tools.logging.Formatter.indent_inc()
+    full_model = config.model.build()
+    quant_model = config.model.get_quant_model(full_model)
+    tools.logging.Formatter.indent_dec()
+
+    save_dirpath = os.path.join(config.output.running_job_dirpath, "cache")
+    save_model = False
+    if isinstance(config.save_model, str):
+        if config.save_model.lower() in ("false", "none", "null", "nil"):
+            save_model = False
+        elif config.save_model.lower() in ("true", "default"):
+            save_dirpath, save_model = os.path.join(config.output.running_job_dirpath, "model"), True
+        else:
+            save_dirpath, save_model = config.save_model, True
+    elif config.save_model:
+        save_dirpath, save_model = os.path.join(config.output.running_job_dirpath, "model"), True
+
+    ptq(
+        quant_model,
+        config.quant,
+        cache=config.cache,
+        load_dirpath=config.load_from,
+        save_dirpath=save_dirpath,
+        copy_on_save=config.copy_on_save,
+        save_model=save_model,
+        full_model=full_model,
+    )
+    config.output.unlock()
+    return full_model
+
+
+if __name__ == "__main__":
+    print('got here')
+    config, _, unused_cfgs, unused_args, unknown_args = Sam2PtqRunConfig.get_parser().parse_known_args()
+    assert isinstance(config, Sam2PtqRunConfig)
+    if len(unused_cfgs) > 0:
+        tools.logging.warning(f"Unused configurations: {unused_cfgs}")
+    if unused_args is not None:
+        tools.logging.warning(f"Unused arguments: {unused_args}")
+    assert len(unknown_args) == 0, f"Unknown arguments: {unknown_args}"
+    try:
+        main(config, logging_level=tools.logging.DEBUG)
+    except Exception as e:
+        tools.logging.Formatter.indent_reset()
+        tools.logging.error("=== Error ===")
+        tools.logging.error(traceback.format_exc())
+        tools.logging.shutdown()
+        traceback.print_exc()
+        config.output.unlock(error=True)
+        raise e

@@ -1,5 +1,5 @@
-# SAM2 Hiera-Large W4A8 with SVDQuant Configuration
-# 4-bit weights with low-rank compensation, 8-bit activations
+# SAM2 Hiera-Large W4A4 with SVDQuant Configuration
+# 4-bit weights and 4-bit activations with low-rank compensation
 
 model:
   name: large
@@ -11,7 +11,7 @@ cache:
 
 quant:
   calib:
-    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/coco/val2017
+    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017
     num_samples: 256
     batch_size: 1
     image_size: 1024
@@ -29,7 +29,7 @@ quant:
       exclusive: false
 
   ipts:
-    dtype: uint8
+    dtype: uint4
     group_shapes: [[1, -1]]
     static: false
 
@@ -49,7 +49,7 @@ quant:
 
 output:
   root: ./outputs/sam2
-  job: hiera_large_w4a8_svdquant
+  job: hiera_large_w4a4_svdquant
 
 save_model: true
 seed: 42

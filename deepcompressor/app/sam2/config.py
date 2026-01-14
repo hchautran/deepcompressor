@@ -1,27 +1,35 @@
 # -*- coding: utf-8 -*-
-"""SAM2 quantization run configuration."""
+"""Top-level config of post-training quantization for SAM2."""
 
 import os
 from dataclasses import dataclass, field
 
+import omniconfig
 import torch
-from omniconfig import configclass
+import torch.nn as nn
+from omniconfig import ConfigParser, configclass
 
-from deepcompressor.utils import tools
+from deepcompressor.data.utils.dtype import eval_dtype
 from deepcompressor.utils.config.output import OutputConfig
 
-from .cache.config import Sam2PtqCacheConfig
+from .cache import Sam2PtqCacheConfig, Sam2QuantCacheConfig
 from .nn.struct import Sam2ModelStruct
-from .quant.config import Sam2QuantConfig
+from .quant import Sam2QuantConfig
 
-__all__ = ["Sam2PtqRunConfig", "Sam2ModelConfig"]
+__all__ = [
+    "Sam2ModelConfig",
+    "Sam2PtqRunConfig",
+    "Sam2PtqCacheConfig",
+    "Sam2QuantCacheConfig",
+    "Sam2QuantConfig",
+]
 
 
-SAM2_MODELS = {
+SAM2_NAME_TO_HF_ID = {
     "tiny": "facebook/sam2.1-hiera-tiny",
     "small": "facebook/sam2.1-hiera-small",
-    "base": "facebook/sam2.1-hiera-base-plus",
     "base-plus": "facebook/sam2.1-hiera-base-plus",
+    "base": "facebook/sam2.1-hiera-base-plus",
     "large": "facebook/sam2.1-hiera-large",
 }
 
@@ -29,196 +37,109 @@ SAM2_MODELS = {
 @configclass
 @dataclass
 class Sam2ModelConfig:
-    """SAM2 model configuration.
+    """SAM2 model configuration."""
 
-    Args:
-        name (`str`, *optional*, defaults to `"tiny"`):
-            The model name or shortcut (tiny, small, base, large).
-        path (`str`, *optional*, defaults to `""`):
-            The HuggingFace model path (overrides name).
-        device (`str`, *optional*, defaults to `"cuda"`):
-            The device to load the model on.
-        dtype (`str`, *optional*, defaults to `"float16"`):
-            The data type for the model.
-    """
-
-    name: str = "tiny"
-    path: str = ""
+    name: str
     device: str = "cuda"
-    dtype: str = "float16"
+    dtype: torch.dtype = field(
+        default_factory=lambda s=torch.float16: eval_dtype(s, with_quant_dtype=False, with_none=False)
+    )
+    hf_id: str = ""
+    config: str = ""
+    ckpt_path: str = ""
+    image_size: int = 1024
 
-    def __post_init__(self) -> None:
-        if not self.path:
-            self.path = SAM2_MODELS.get(self.name.lower(), self.name)
+    def resolve_hf_id(self) -> str:
+        if self.hf_id:
+            return self.hf_id
+        return SAM2_NAME_TO_HF_ID.get(self.name, self.name)
 
-    @property
-    def torch_dtype(self) -> torch.dtype:
-        """Get the torch dtype."""
-        dtype_map = {
-            "float16": torch.float16,
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-            "fp16": torch.float16,
-            "fp32": torch.float32,
-            "bf16": torch.bfloat16,
-        }
-        return dtype_map.get(self.dtype.lower(), torch.float16)
+    def build(self) -> nn.Module:
+        def import_builders():
+            from sam2.build_sam import build_sam2, build_sam2_hf
 
-    def build(self) -> tuple:
-        """Build the SAM2 model and processor.
+            return build_sam2, build_sam2_hf
 
-        Returns:
-            Tuple of (model, processor, model_struct).
-        """
-        logger = tools.logging.getLogger(__name__)
-        logger.info(f"Loading SAM2 model from {self.path}")
+        def init_hydra_if_needed():
+            from hydra.core.global_hydra import GlobalHydra
+            from hydra import initialize_config_dir
 
-        from transformers import Sam2Model, Sam2Processor
+            if GlobalHydra().is_initialized():
+                return
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+            sam2_root = os.path.join(repo_root, "sam2")
+            config_dir = os.path.join(sam2_root, "sam2")
+            initialize_config_dir(config_dir=config_dir, version_base=None, job_name="sam2_ptq")
 
-        model = Sam2Model.from_pretrained(
-            self.path,
-            torch_dtype=self.torch_dtype,
-        ).to(self.device)
-        model.eval()
+        try:
+            build_sam2, build_sam2_hf = import_builders()
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "parent directory of the sam2 repository" not in msg:
+                raise
+            # Force-import the sam2 package from the repo's package dir to avoid shadowing.
+            import importlib
+            import sys
 
-        processor = Sam2Processor.from_pretrained(self.path)
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+            sam2_pkg = os.path.join(repo_root, "sam2", "sam2")
+            if sam2_pkg not in sys.path:
+                sys.path.insert(0, sam2_pkg)
+            sys.modules.pop("sam2", None)
+            sys.modules.pop("sam2.build_sam", None)
+            build_sam2, build_sam2_hf = import_builders()
+        init_hydra_if_needed()
 
-        model_struct = Sam2ModelStruct.construct(model)
+        if self.config or self.ckpt_path:
+            model = build_sam2(
+                config_file=self.config,
+                ckpt_path=self.ckpt_path or None,
+                device=self.device,
+                mode="eval",
+            )
+        else:
+            model = build_sam2_hf(self.resolve_hf_id(), device=self.device, mode="eval")
+        model = model.to(device=self.device, dtype=self.dtype)
+        return model
 
-        return model, processor, model_struct
+    def get_quant_model(self, model: nn.Module) -> nn.Module:
+        return model.image_encoder.trunk
 
 
 @configclass
 @dataclass
 class Sam2PtqRunConfig:
-    """SAM2 post-training quantization run configuration.
+    """Top-level config of post-training quantization for SAM2."""
 
-    Args:
-        model (`Sam2ModelConfig`):
-            The model configuration.
-        quant (`Sam2QuantConfig`):
-            The quantization configuration.
-        cache (`Sam2PtqCacheConfig`):
-            The cache configuration.
-        output (`OutputConfig`):
-            The output configuration.
-        seed (`int`, *optional*, defaults to `42`):
-            The random seed.
-        load_from (`str`, *optional*, defaults to `""`):
-            The directory path to load the quantization checkpoint.
-        save_model (`str`, *optional*, defaults to `""`):
-            The path to save the quantized model.
-        copy_on_save (`bool`, *optional*, defaults to `False`):
-            Whether to copy the cache to the save directory.
-    """
-
-    model: Sam2ModelConfig
-    quant: Sam2QuantConfig
-    cache: Sam2PtqCacheConfig
     output: OutputConfig
-    seed: int = 42
+    model: Sam2ModelConfig
+    quant: Sam2QuantConfig = field(metadata={omniconfig.ARGPARSE_KWARGS: {"prefix": ""}})
+    cache: Sam2PtqCacheConfig = None
+    seed: int = 12345
     load_from: str = ""
     save_model: str = ""
     copy_on_save: bool = False
 
     def __post_init__(self) -> None:
-        # Set random seeds
+        if self.quant.calib.path:
+            self.quant.calib.path = os.path.abspath(os.path.expanduser(self.quant.calib.path))
+        self.quant.calib.image_size = self.model.image_size
+        if self.cache is not None:
+            if self.quant.is_enabled():
+                self.cache.dirpath = self.quant.generate_cache_dirpath(
+                    root=self.cache.root, shift=False, default_dtype=self.model.dtype
+                )
+                self.cache.path = self.cache.dirpath.clone().add_children(f"{self.model.name}.pt")
+            else:
+                self.cache.dirpath = self.cache.path = None
+        if self.output.dirname == "default":
+            self.output.dirname = self.model.name
+        self.output.dirpath = os.path.join(self.output.root, self.output.dirname)
         torch.manual_seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
-        if self.quant.is_enabled():
-            self.cache.dirpath = self.quant.generate_cache_dirpath(
-                root=self.cache.root, default_dtype=self.model.torch_dtype
-            )
-            self.cache.path = self.cache.dirpath.clone().add_children(f"{self.model.name}.pt")
-        else:
-            self.cache.dirpath = self.cache.path = None
-
-    def build_calib_dataloader(self):
-        """Build the calibration dataloader from config.
-
-        Returns:
-            DataLoader or None if no calibration path is configured.
-        """
-        logger = tools.logging.getLogger(__name__)
-
-        if not hasattr(self.quant, 'calib') or self.quant.calib is None:
-            return None
-
-        calib_config = self.quant.calib
-        if not calib_config.path:
-            logger.warning("No calibration path configured")
-            return None
-
-        if not os.path.exists(calib_config.path):
-            logger.warning(f"Calibration path does not exist: {calib_config.path}")
-            return None
-
-        logger.info(f"Building calibration dataloader from {calib_config.path}")
-        logger.info(f"  - num_samples: {calib_config.num_samples}")
-        logger.info(f"  - batch_size: {calib_config.batch_size}")
-        logger.info(f"  - image_size: {calib_config.image_size}")
-
-        return calib_config.build_dataloader()
-
-    def main(self) -> None:
-        """Run the PTQ pipeline."""
-        from .ptq import ptq
-
-        logger = tools.logging.getLogger(__name__)
-
-        # Build model
-        logger.info("=== Building SAM2 Model ===")
-        model, processor, model_struct = self.model.build()
-
-        logger.info(f"Model has {model_struct.num_blocks} blocks")
-
-        # Build calibration dataloader
-        logger.info("=== Building Calibration DataLoader ===")
-        calib_dataloader = self.build_calib_dataloader()
-        if calib_dataloader is not None:
-            logger.info(f"Calibration dataloader ready with {len(calib_dataloader)} batches")
-        else:
-            logger.warning("No calibration dataloader available - using weight-based approximation")
-
-        # Run PTQ
-        logger.info("=== Running Post-Training Quantization ===")
-
-        save_dirpath = ""
-        if self.save_model:
-            if isinstance(self.save_model, str):
-                save_model_value = self.save_model.lower()
-            else:
-                save_model_value = self.save_model
-            if save_model_value in ("false", "none", "null", "nil", False):
-                save_model = False
-            elif save_model_value in ("true", "default", True):
-                save_dirpath = os.path.join(self.output.running_job_dirpath, "model")
-                save_model = True
-            else:
-                save_dirpath = self.save_model
-                save_model = True
-        else:
-            save_model = False
-
-        model_struct = ptq(
-            model_struct,
-            self.quant,
-            cache=self.cache,
-            calib_dataloader=calib_dataloader,
-            load_dirpath=self.load_from,
-            save_dirpath=save_dirpath if save_dirpath else os.path.join(self.output.running_job_dirpath, "cache"),
-            copy_on_save=self.copy_on_save,
-            save_model=save_model,
-        )
-
-        logger.info("=== PTQ Complete ===")
-
-        return model_struct
 
     @classmethod
-    def get_parser(cls):
-        """Get the argument parser for this configuration."""
-        from omniconfig import OmniConfig
-
-        return OmniConfig.from_dataclass(cls)
+    def get_parser(cls) -> ConfigParser:
+        parser = ConfigParser("SAM2 Run configuration")
+        Sam2QuantConfig.set_key_map(Sam2ModelStruct._get_default_key_map())
+        parser.add_config(cls)
+        return parser

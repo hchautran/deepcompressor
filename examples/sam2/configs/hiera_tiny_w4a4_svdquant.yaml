@@ -1,5 +1,5 @@
-# SAM2 Hiera-Tiny W4A8 Quantization Configuration
-# 4-bit weights, 8-bit activations
+# SAM2 Hiera-Tiny W4A4 with SVDQuant Configuration
+# 4-bit weights and 4-bit activations with low-rank compensation
 
 model:
   name: tiny
@@ -11,8 +11,8 @@ cache:
 
 quant:
   calib:
-    path: /path/to/coco/val2017  # Update with your calibration dataset path
-    num_samples: 128
+    path: /pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017
+    num_samples: 256
     batch_size: 1
     image_size: 1024
     seed: 42
@@ -23,15 +23,18 @@ quant:
     kernel_gptq:
       damp_percentage: 0.01
       block_size: 128
-      num_inv_tries: 200
+      num_inv_tries: 250
+    low_rank:
+      rank: 32
+      exclusive: false
 
   ipts:
-    dtype: uint8
-    group_shapes: [[1, -1]]  # per-token quantization
+    dtype: uint4
+    group_shapes: [[1, -1]]
     static: false
 
   opts:
-    dtype: null  # disabled
+    dtype: null
 
   smooth:
     proj:
@@ -40,9 +43,13 @@ quant:
       num_grids: 20
       alpha: 0.5
 
+  rotation:
+    transforms: [hadamard]
+    random: false
+
 output:
   root: ./outputs/sam2
-  job: hiera_tiny_w4a8
+  job: hiera_tiny_w4a4_svdquant
 
 save_model: true
 seed: 42

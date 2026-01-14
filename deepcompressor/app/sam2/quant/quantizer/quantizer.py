@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""SAM2 quantizer classes with SVDQuant support."""
+"""Tensor Quantizer module."""
 
 import typing as tp
 from dataclasses import dataclass, field
@@ -9,21 +9,28 @@ import torch.nn as nn
 
 from deepcompressor.calib.config import SkipBasedQuantLowRankCalibConfig
 from deepcompressor.calib.lowrank import LowRankBranch, QuantLowRankCalibrator
+from deepcompressor.calib.range import calibrate_dynamic_range
 from deepcompressor.data.cache import TensorsCache
 from deepcompressor.data.common import TensorType
+from deepcompressor.data.range import DynamicRange
 from deepcompressor.quantizer.processor import Quantizer
 
-from .config import Sam2ActivationQuantizerConfig, Sam2WeightQuantizerConfig
+from .config import (
+    Sam2ActivationQuantizerConfig,
+    Sam2GPTQConfig,
+    Sam2QuantizerConfig,
+    Sam2WeightQuantizerConfig,
+)
 
-__all__ = ["Sam2WeightQuantizer", "Sam2ActivationQuantizer"]
+__all__ = ["Sam2Quantizer", "Sam2WeightQuantizer", "Sam2ActivationQuantizer"]
 
 
 @dataclass
-class Sam2WeightQuantizer(Quantizer):
-    """SAM2 weight quantizer with SVDQuant support.
+class Sam2Quantizer(Quantizer):
+    """Denoising model quantizer class.
 
     Args:
-        config (`Sam2WeightQuantizerConfig` or `None`):
+        config (`Sam2QuantizerConfig` or `None`):
             The quantizer configuration.
         key (`str`, *optional*, defaults to `""`):
             The key of the quantizer.
@@ -31,46 +38,198 @@ class Sam2WeightQuantizer(Quantizer):
             The type of the tensor to quantize.
         channels_dim (`int` or `None`, *optional*, defaults to `None`):
             The dimension of channels.
+        scale (`torch.Tensor` or `Sequence[torch.Tensor]` or `None`, *optional*, defaults to `None`):
+            The scale tensor.
+        zero (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+            The zero point tensor.
+        dynamic_range (`DynamicRange` or `Sequence[DynamicRange]` or `None`, *optional*, defaults to `None`):
+            The dynamic range.
+        range_bound (`RangeBound` or `None`, *optional*, defaults to `None`):
+            The dynamic range bound.
+        quant_range (`QuantRange` or `None`, *optional*, defaults to `None`):
+            The quantization range.
+        default_dtype (`torch.dtype` or `None`, *optional*, defaults to `None`):
+            The default scale dtype
         develop_dtype (`torch.dtype`, *optional*, defaults to `torch.float32`):
             The quantization development dtype.
+
+        kernel (`Sam2GPTQConfig` or `None`, *optional*, defaults to `MISSING`):
+            The GPTQ kernel configuration.
+            If not provided (i.e., `MISSING`), the GPTQ configuration from the `config` will be used.
+        low_rank (`QuantLowRankConfig` or `None`, *optional*, defaults to `MISSING`):
+            The quantization low-rank branch configuration.
+            If not provided (i.e., `MISSING`), the low-rank branch configuration from the `config` will be used.
+        input_packager (`BaseInputPackager` or `None`, *optional*, defaults to `None`):
+            The input packager, used for unpacking and repacking the input tensor(s).
+        output_packager (`BaseOutputPackager` or `None`, *optional*, defaults to `None`):
+            The output packager, used for unpacking and repacking the output tensor(s).
     """
 
-    config: Sam2WeightQuantizerConfig = field(default=None)
-    tensor_type: TensorType = field(init=False, default=TensorType.Weights)
-    low_rank: SkipBasedQuantLowRankCalibConfig | None = field(init=False, default=None)
+    config: Sam2QuantizerConfig
+    kernel: Sam2GPTQConfig | None = field(init=False)
+    low_rank: SkipBasedQuantLowRankCalibConfig | None = field(init=False)
+    tensor_type: TensorType = TensorType.Weights
 
     def __post_init__(self) -> None:
-        if self.config is not None:
-            self.low_rank = self.config.low_rank
+        self.kernel = self.config.kernel_gptq
+        self.low_rank = self.config.low_rank
 
-    @classmethod
-    def build(
-        cls,
-        config: Sam2WeightQuantizerConfig,
-        weight: torch.Tensor,
-        key: str = "",
-        **kwargs,
-    ) -> "Sam2WeightQuantizer":
-        """Build a weight quantizer from configuration.
+    def calibrate_dynamic_range(
+        self,
+        modules: tp.Sequence[nn.Module],
+        activations: TensorsCache,
+        weights: tp.Sequence[nn.Parameter] = None,
+        eval_inputs: TensorsCache | None = None,
+        eval_module: nn.Module | None = None,
+        eval_kwargs: dict[str, tp.Any] | None = None,
+        orig_weights: tp.Sequence[tuple[nn.Parameter, torch.Tensor]] | None = None,
+        orig_activations: TensorsCache | None = None,
+        orig_eval_inputs: TensorsCache | None = None,
+    ) -> tp.Sequence[DynamicRange] | None:
+        """Calibrate the dynamic range.
 
         Args:
-            config: Weight quantizer configuration.
-            weight: Weight tensor to quantize.
-            key: The key/name of the module being quantized.
+            modules (`Sequence[nn.Module]`):
+                The modules to calibrate.
+            activations (`TensorsCache`):
+                The inputs cache if the tensor type is not outputs, or the outputs cache if the tensor type is outputs.
+            weights (`Sequence[nn.Parameter]` or `None`, *optional*, defaults to `None`):
+                The weights to calibrate.
+                If not provided, the weights of the modules will be used.
+            eval_inputs (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The cache of the inputs for evaluation.
+                If not provided, the `activations` cache will be used.
+            eval_module (`nn.Module` or `None`, *optional*, defaults to `None`):
+                The module to evaluate the quantization error.
+                If not provided, the module to calibrate will be used.
+            eval_kwargs (`dict[str, tp.Any]` or `None`, *optional*, defaults to `None`):
+                The keyword arguments for evaluation.
+            orig_weights (`Sequence[tuple[nn.Parameter, torch.Tensor]]` or `None`, *optional*, defaults to `None`):
+                The original weights.
+            orig_activations (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The original activations.
+            orig_eval_inputs (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The original evaluation inputs.
 
         Returns:
-            Sam2WeightQuantizer instance.
+            `Sequence[DynamicRange]` or `None`:
+                The dynamic ranges of each quantization step.
         """
-        if not config.is_enabled():
-            return None
+        if (
+            not self.is_enabled()
+            or self.config.calib_range is None
+            or not self.config.calib_range.is_enabled_for(self.key)
+        ):
+            self.dynamic_range = None
+        else:
+            self.dynamic_range = calibrate_dynamic_range(
+                tensor_type=self.tensor_type,
+                config=self.config.calib_range,
+                static=self.config.static,
+                quantizer=self,
+                modules=modules,
+                activations=activations,
+                weights=weights,
+                eval_inputs=eval_inputs,
+                eval_module=eval_module,
+                eval_kwargs=eval_kwargs,
+                orig_weights=orig_weights,
+                orig_activations=orig_activations,
+                orig_eval_inputs=orig_eval_inputs,
+            )
+        return self.dynamic_range
 
-        quantizer = cls(
-            config=config,
-            channels_dim=0,
-            key=key,
-            develop_dtype=kwargs.get("develop_dtype", torch.float32),
+
+@dataclass
+class Sam2WeightQuantizer(Sam2Quantizer):
+    """Diffusion model weight quantizer class.
+
+    Args:
+
+    Args:
+        config (`Sam2WeightQuantizerConfig` or `None`):
+            The quantizer configuration.
+        key (`str`, *optional*, defaults to `""`):
+            The key of the quantizer.
+        scale (`torch.Tensor` or `Sequence[torch.Tensor]` or `None`, *optional*, defaults to `None`):
+            The scale tensor.
+        zero (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+            The zero point tensor.
+        dynamic_range (`DynamicRange` or `Sequence[DynamicRange]` or `None`, *optional*, defaults to `None`):
+            The dynamic range.
+        range_bound (`RangeBound` or `None`, *optional*, defaults to `None`):
+            The dynamic range bound.
+        quant_range (`QuantRange` or `None`, *optional*, defaults to `None`):
+            The quantization range.
+        default_dtype (`torch.dtype` or `None`, *optional*, defaults to `None`):
+            The default scale dtype
+        develop_dtype (`torch.dtype`, *optional*, defaults to `torch.float32`):
+            The quantization development dtype.
+
+        kernel (`Sam2GPTQConfig` or `None`, *optional*, defaults to `MISSING`):
+            The GPTQ kernel configuration.
+            If not provided (i.e., `MISSING`), the GPTQ configuration from the `config` will be used.
+        low_rank (`QuantLowRankConfig` or `None`, *optional*, defaults to `MISSING`):
+            The quantization low-rank branch configuration.
+            If not provided (i.e., `MISSING`), the low-rank branch configuration from the `config` will be used.
+        input_packager (`BaseInputPackager` or `None`, *optional*, defaults to `None`):
+            The input packager, used for unpacking and repacking the input tensor(s).
+        output_packager (`BaseOutputPackager` or `None`, *optional*, defaults to `None`):
+            The output packager, used for unpacking and repacking the output tensor(s).
+    """
+
+    config: Sam2WeightQuantizerConfig
+    channels_dim: None = field(init=False, default=None)
+    tensor_type: TensorType = field(init=False, default=TensorType.Weights)
+
+    def calibrate_dynamic_range(
+        self,
+        module: nn.Module,
+        inputs: TensorsCache,
+        weight: nn.Parameter | None = None,
+        eval_inputs: TensorsCache | None = None,
+        eval_module: nn.Module | None = None,
+        eval_kwargs: dict[str, tp.Any] | None = None,
+        orig_inputs: TensorsCache | None = None,
+        orig_eval_inputs: TensorsCache | None = None,
+    ) -> tp.Sequence[DynamicRange] | None:
+        """Calibrate the dynamic range.
+
+        Args:
+            module (`nn.Module`):
+                The module to calibrate.
+            inputs (`TensorsCache`):
+                The inputs cache.
+            weight (`nn.Parameter` or `None`, *optional*, defaults to `None`):
+                The weight parameter to calibrate.
+                If not provided, the weight of the `module` will be used.
+            eval_inputs (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The cache of the inputs for evaluation.
+                If not provided, the `activations` cache will be used.
+            eval_module (`nn.Module` or `None`, *optional*, defaults to `None`):
+                The module to evaluate the quantization error.
+                If not provided, the module to calibrate will be used.
+            eval_kwargs (`dict[str, tp.Any]` or `None`, *optional*, defaults to `None`):
+                The keyword arguments for evaluation.
+            orig_inputs (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The original inputs.
+            orig_eval_inputs (`TensorsCache` or `None`, *optional*, defaults to `None`):
+                The original evaluation inputs.
+
+        Returns:
+            `Sequence[DynamicRange]` or `None`:
+                The dynamic ranges of each quantization step.
+        """
+        return super().calibrate_dynamic_range(
+            modules=[module],
+            weights=[weight] if weight is not None else [module.weight],
+            activations=inputs,
+            eval_inputs=eval_inputs,
+            eval_module=eval_module,
+            eval_kwargs=eval_kwargs,
+            orig_activations=orig_inputs,
+            orig_eval_inputs=orig_eval_inputs,
         )
-        return quantizer
 
     def calibrate_low_rank(
         self,
@@ -84,25 +243,7 @@ class Sam2WeightQuantizer(Quantizer):
         orig_inputs: TensorsCache | None = None,
         orig_eval_inputs: TensorsCache | None = None,
     ) -> LowRankBranch:
-        """Calibrate the quantization low-rank branch for SVDQuant.
-
-        This method uses the QuantLowRankCalibrator to find optimal low-rank
-        compensation matrices that minimize quantization error.
-
-        Args:
-            input_quantizer: The activation quantizer for inputs.
-            modules: The modules to calibrate.
-            inputs: The cached input activations.
-            weights: The weight parameters (optional, uses module weights if None).
-            eval_inputs: Cached inputs for evaluation.
-            eval_module: Module to evaluate quantization error.
-            eval_kwargs: Keyword arguments for evaluation.
-            orig_inputs: Original (unquantized) inputs for comparison.
-            orig_eval_inputs: Original evaluation inputs.
-
-        Returns:
-            LowRankBranch: The calibrated low-rank branch.
-        """
+        """Calibrate the quantization low-rank branch."""
         if weights is None:
             weights = [module.weight for module in modules]
         return QuantLowRankCalibrator(
@@ -123,8 +264,8 @@ class Sam2WeightQuantizer(Quantizer):
 
 
 @dataclass
-class Sam2ActivationQuantizer(Quantizer):
-    """SAM2 activation quantizer.
+class Sam2ActivationQuantizer(Sam2Quantizer):
+    """Diffusion model activation quantizer class.
 
     Args:
         config (`Sam2ActivationQuantizerConfig` or `None`):
@@ -135,36 +276,32 @@ class Sam2ActivationQuantizer(Quantizer):
             The type of the tensor to quantize.
         channels_dim (`int` or `None`, *optional*, defaults to `None`):
             The dimension of channels.
+        scale (`torch.Tensor` or `Sequence[torch.Tensor]` or `None`, *optional*, defaults to `None`):
+            The scale tensor.
+        zero (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+            The zero point tensor.
+        dynamic_range (`DynamicRange` or `Sequence[DynamicRange]` or `None`, *optional*, defaults to `None`):
+            The dynamic range.
+        range_bound (`RangeBound` or `None`, *optional*, defaults to `None`):
+            The dynamic range bound.
+        quant_range (`QuantRange` or `None`, *optional*, defaults to `None`):
+            The quantization range.
+        default_dtype (`torch.dtype` or `None`, *optional*, defaults to `None`):
+            The default scale dtype
         develop_dtype (`torch.dtype`, *optional*, defaults to `torch.float32`):
             The quantization development dtype.
+
+        input_packager (`BaseInputPackager` or `None`, *optional*, defaults to `None`):
+            The input packager, used for unpacking and repacking the input tensor(s).
+        output_packager (`BaseOutputPackager` or `None`, *optional*, defaults to `None`):
+            The output packager, used for unpacking and repacking the output tensor(s).
+        develop_dtype (torch.dtype, optional): The develop dtype. Defaults to ``torch.float32``.
     """
 
-    config: Sam2ActivationQuantizerConfig = field(default=None)
-    tensor_type: TensorType = field(init=False, default=TensorType.Inputs)
+    config: Sam2ActivationQuantizerConfig
+    tensor_type: TensorType = TensorType.Inputs
 
-    @classmethod
-    def build(
-        cls,
-        config: Sam2ActivationQuantizerConfig,
-        key: str = "",
-        **kwargs,
-    ) -> "Sam2ActivationQuantizer":
-        """Build an activation quantizer from configuration.
-
-        Args:
-            config: Activation quantizer configuration.
-            key: The key/name of the module being quantized.
-
-        Returns:
-            Sam2ActivationQuantizer instance.
-        """
-        if not config.is_enabled():
-            return None
-
-        quantizer = cls(
-            config=config,
-            channels_dim=-1,  # Last dimension for activations
-            key=key,
-            develop_dtype=kwargs.get("develop_dtype", torch.float32),
-        )
-        return quantizer
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        assert self.tensor_type != TensorType.Weights, "The tensor type cannot be weights."
+        assert isinstance(self.channels_dim, int), "The channels dimension must be provided."
