@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """SAM2 pipeline configuration module."""
 
+import os
+import sys
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -11,6 +13,44 @@ from deepcompressor.data.utils.dtype import eval_dtype
 from deepcompressor.utils import tools
 
 __all__ = ["SAM2PipelineConfig"]
+
+
+def _setup_sam2_path(sam2_repo_path: str | None = None) -> None:
+    """Setup the SAM2 import path to avoid shadowing issues.
+
+    When the sam2 repository is cloned inside the project directory,
+    Python may import the repository directory instead of the installed package.
+    This function adds the correct path to sys.path.
+
+    Args:
+        sam2_repo_path: Path to the sam2 repository (contains sam2/sam2/).
+                       If None, tries to auto-detect.
+    """
+    if sam2_repo_path is None:
+        # Try to find sam2 repo relative to this file
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        # Go up to deepcompressor root
+        deepcompressor_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_dir))))
+        possible_paths = [
+            os.path.join(deepcompressor_root, "sam2"),  # /path/to/deepcompressor/sam2
+            os.path.join(os.path.dirname(deepcompressor_root), "sam2"),  # sibling directory
+        ]
+        for path in possible_paths:
+            if os.path.isdir(path) and os.path.isdir(os.path.join(path, "sam2")):
+                sam2_repo_path = path
+                break
+
+    if sam2_repo_path and os.path.isdir(sam2_repo_path):
+        # The actual sam2 package is inside the repo at sam2/sam2/
+        # We need to add the repo path to sys.path so that 'import sam2' works
+        # But we also need to make sure we're not in the parent directory
+        sam2_package_path = os.path.join(sam2_repo_path, "sam2")
+        if os.path.isdir(sam2_package_path):
+            # Remove any existing sam2 paths that might cause conflicts
+            sys.path = [p for p in sys.path if "sam2" not in os.path.basename(p)]
+            # Add the repo path (not the package path) to sys.path
+            if sam2_repo_path not in sys.path:
+                sys.path.insert(0, sam2_repo_path)
 
 
 # Model ID to config file mappings
@@ -52,6 +92,8 @@ class SAM2PipelineConfig:
             The data type of the model.
         device (`str`, *optional*, defaults to `"cuda"`):
             The device to load the model on.
+        sam2_repo_path (`str`, *optional*):
+            Path to the sam2 repository. If not provided, auto-detects.
     """
 
     name: str
@@ -60,6 +102,7 @@ class SAM2PipelineConfig:
         default_factory=lambda s=torch.float32: eval_dtype(s, with_quant_dtype=False, with_none=False)
     )
     device: str = "cuda"
+    sam2_repo_path: str = ""
     family: str = field(init=False)
 
     def __post_init__(self):
@@ -99,6 +142,9 @@ class SAM2PipelineConfig:
         if device is None:
             device = self.device
 
+        # Setup SAM2 import path to avoid shadowing issues
+        _setup_sam2_path(self.sam2_repo_path or None)
+
         # Try to import sam2
         try:
             from sam2.build_sam import build_sam2, build_sam2_hf
@@ -107,6 +153,20 @@ class SAM2PipelineConfig:
                 "sam2 package not found. Please install it from "
                 "https://github.com/facebookresearch/sam2"
             )
+        except RuntimeError as e:
+            if "parent directory" in str(e):
+                # This is the shadowing error - try to fix it
+                logger.warning(f"SAM2 import issue detected: {e}")
+                logger.info("Attempting to fix SAM2 import path...")
+                # Force reimport after path fix
+                import importlib
+                if "sam2" in sys.modules:
+                    del sys.modules["sam2"]
+                if "sam2.build_sam" in sys.modules:
+                    del sys.modules["sam2.build_sam"]
+                from sam2.build_sam import build_sam2, build_sam2_hf
+            else:
+                raise
 
         if self.checkpoint:
             # Load from local checkpoint

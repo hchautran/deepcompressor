@@ -4,10 +4,14 @@
 # Usage:
 #   ./run_quantize.sh [model] [quant_config] [calib_path] [output_dir]
 #
+# Environment variables:
+#   SAM2_REPO_PATH - Path to sam2 repository (auto-detected if not set)
+#
 # Examples:
 #   ./run_quantize.sh sam2.1-hiera-large w4a4
 #   ./run_quantize.sh sam2-hiera-base-plus w4a4-fast /path/to/coco/val2017
 #   ./run_quantize.sh sam2.1-hiera-large w4a4 /path/to/coco/val2017 /path/to/output
+#   SAM2_REPO_PATH=/path/to/sam2 ./run_quantize.sh sam2.1-hiera-large w4a4
 
 set -e
 
@@ -16,6 +20,7 @@ MODEL=${1:-"sam2.1-hiera-large"}
 QUANT_CONFIG=${2:-"w4a4"}
 CALIB_PATH=${3:-"/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/deepcompressor/data/coco/val2017"}
 OUTPUT_DIR=${4:-"runs/sam2"}
+SAM2_REPO_PATH=${SAM2_REPO_PATH:-""}
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

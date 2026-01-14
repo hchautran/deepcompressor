@@ -147,6 +147,12 @@ Available models:
         choices=["float16", "float32", "bfloat16"],
         help="Model dtype (default: float16)",
     )
+    parser.add_argument(
+        "--sam2_repo_path",
+        type=str,
+        default="",
+        help="Path to sam2 repository (auto-detected if not provided)",
+    )
 
     # Other options
     parser.add_argument(
@@ -244,6 +250,7 @@ def main():
         checkpoint=args.checkpoint,
         dtype=dtype,
         device=args.device,
+        sam2_repo_path=args.sam2_repo_path,
     )
 
     # Create output config
@@ -280,6 +287,8 @@ def main():
     print(f"Output dir:       {args.output_dir}")
     print(f"Device:           {args.device}")
     print(f"Dtype:            {args.dtype}")
+    if args.sam2_repo_path:
+        print(f"SAM2 repo:        {args.sam2_repo_path}")
     print("=" * 60)
 
     # Check calibration path
